@@ -70,6 +70,7 @@ python tools/avellaneda_perpetual_calibrate.py \
 | 完整 Gate 永續連接器測試目錄 | 87 項通過 |
 | 真正 Hummingbot Clock／ScriptStrategyBase／Gate 整合測試 | 3 項通過 |
 | Cython 模組 | 58 個編譯完成 |
+| 正式 TradingCore 策略／設定載入器 | 校準後 adaptive 預覽 YAML 載入成功，確認 40U／50U 及 gamma 校準資料 |
 | flake8、isort、Python 語法與 git diff 空白檢查 | 通過 |
 
 核心 suite 保留原本明確 20U／30U 的測試情境，另外測試新的 40U／50U 設定，
@@ -88,6 +89,13 @@ python tools/avellaneda_perpetual_calibrate.py \
 HTTP 測試用 aiohttp 3.9.5、aioresponses 0.7.8，避免新版本 aiohttp 的
 `stream_writer` 建構參數與舊測試替身衝突。原有 Gate suite 會留下未匹配的
 mock 背景連線警告，但全部 87 項測試斷言通過；新增三項整合測試不啟動真實網路。
+
+另補齊隔離環境的 UI、MQTT 與技術指標依賴，透過正式
+`TradingCore.load_script_class` 識別 `AvellanedaPerpetual`，載入工具匯出的
+巢狀校準 YAML，確認 `adaptive`、40U 上限、50U 預算及預覽旗標。
+此檢查使用本機 pandas-ta 0.4.71b0、Numba 0.62.1、protobuf 6.32.1、
+prompt_toolkit 3.0.51、paho-mqtt 2.1.0，沒有改動專案的依賴設定。
+沒有啟動真實帳戶、MQTT 連線或實盤時鐘。
 
 ## 尚未完成的實盤驗證
 
