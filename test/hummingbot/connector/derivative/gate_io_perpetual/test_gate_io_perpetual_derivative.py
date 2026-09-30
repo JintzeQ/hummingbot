@@ -5,7 +5,7 @@ import re
 from copy import deepcopy
 from decimal import Decimal
 from typing import Any, Callable, List, Optional, Tuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pandas as pd
 from aioresponses import aioresponses
@@ -25,6 +25,28 @@ from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 
 class GateIoPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDerivativeTests):
     _logger = logging.getLogger(__name__)
+
+    def test_close_orders_send_reduce_only_for_maker_and_market(self):
+        for order_type in (OrderType.LIMIT_MAKER, OrderType.MARKET):
+            for side in (TradeType.BUY, TradeType.SELL):
+                for action in (PositionAction.OPEN, PositionAction.CLOSE):
+                    with self.subTest(order_type=order_type, side=side, action=action):
+                        api_post = AsyncMock(return_value={"id": "123", "finish_as": "filled"})
+                        with patch.object(self.exchange, "_api_post", api_post), patch.object(
+                            self.exchange, "exchange_symbol_associated_to_pair",
+                            AsyncMock(return_value=self.exchange_trading_pair)
+                        ), patch.object(self.exchange, "_format_amount_to_size", return_value=Decimal("1")):
+                            self.async_run_with_timeout(self.exchange._place_order(
+                                order_id="t-HBOT-test", trading_pair=self.trading_pair,
+                                amount=Decimal("0.0001"), trade_type=side, order_type=order_type,
+                                price=Decimal("10000"), position_action=action))
+                        data = api_post.call_args.kwargs["data"]
+                        if action == PositionAction.CLOSE:
+                            self.assertIs(True, data["reduce_only"])
+                        else:
+                            self.assertNotIn("reduce_only", data)
+                        self.assertEqual(1.0 if side == TradeType.BUY else -1.0, data["size"])
+                        self.assertEqual("poc" if order_type == OrderType.LIMIT_MAKER else "ioc", data["tif"])
 
     @classmethod
     def setUpClass(cls) -> None:

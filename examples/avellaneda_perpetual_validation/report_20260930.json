@@ -1,0 +1,167 @@
+{
+  "calibration": {
+    "version": "relative-log-inventory-v1",
+    "trading_pair": "BTC-USDT",
+    "created_at": 1790745719.9374905,
+    "observation_seconds": 902.0107159614563,
+    "window_seconds": 200.0,
+    "valid_samples": 881,
+    "reference_mid": "83238.65",
+    "price_tick": "0.1",
+    "amount_step": "0.0001",
+    "min_amount": "0.0001",
+    "min_notional": "1",
+    "horizon_seconds": 30.0,
+    "max_position_quote": "40",
+    "order_amount_quote": "10",
+    "reference_amount": "0.0001",
+    "reference_inventory": 0.208096625,
+    "variance_per_second": 1.2689330647713716e-09,
+    "gamma_base": 303.30563848568767,
+    "target_ticks": 2.0,
+    "long_bid_change_ticks": -2.0,
+    "long_ask_change_ticks": -2.0,
+    "short_bid_change_ticks": 2.0,
+    "short_ask_change_ticks": 2.0,
+    "quote_settings": {
+      "capital_budget_quote": "5E+1",
+      "order_amount_quote": "1E+1",
+      "max_position_quote": "4E+1",
+      "available_balance_reserve": "5",
+      "leverage": "1",
+      "kappa": "1E+4",
+      "horizon_seconds": "3E+1",
+      "min_spread": "0.0004",
+      "max_spread": "0.02",
+      "maker_fee": "0.0002",
+      "taker_fee": "0.0005",
+      "rebate_rate": "0.6",
+      "adverse_selection_buffer": "0.0001",
+      "volatility_samples": "2E+2",
+      "calibration_target_ticks": "2"
+    }
+  },
+  "replay_summary": [
+    {
+      "scenario": "flat",
+      "mode": "fixed_1",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.0,
+      "gamma_min": 1,
+      "gamma_max": 1,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "flat",
+      "mode": "calibrated_fixed",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.0,
+      "gamma_min": 303.30563848568767,
+      "gamma_max": 303.30563848568767,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "flat",
+      "mode": "adaptive",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.0,
+      "gamma_min": 306.8106412673922,
+      "gamma_max": 369.6487236034661,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_first",
+      "mode": "fixed_1",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.009930360654737945,
+      "gamma_min": 1,
+      "gamma_max": 1,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_first",
+      "mode": "calibrated_fixed",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 3.011928527398857,
+      "gamma_min": 303.30563848568767,
+      "gamma_max": 303.30563848568767,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_first",
+      "mode": "adaptive",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 3.459207376980885,
+      "gamma_min": 314.433055589797,
+      "gamma_max": 385.7371034737849,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "short_first",
+      "mode": "fixed_1",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.009930360783714207,
+      "gamma_min": 1,
+      "gamma_max": 1,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "short_first",
+      "mode": "calibrated_fixed",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 3.011940268595974,
+      "gamma_min": 303.30563848568767,
+      "gamma_max": 303.30563848568767,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "short_first",
+      "mode": "adaptive",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 3.459223278837086,
+      "gamma_min": 314.433055589797,
+      "gamma_max": 385.7371034737849,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_three",
+      "mode": "fixed_1",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 0.02979108158074959,
+      "gamma_min": 1,
+      "gamma_max": 1,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_three",
+      "mode": "calibrated_fixed",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 9.035750358792594,
+      "gamma_min": 303.30563848568767,
+      "gamma_max": 303.30563848568767,
+      "spread_floor_fraction": 1.0
+    },
+    {
+      "scenario": "long_three",
+      "mode": "adaptive",
+      "observations": 287,
+      "mean_abs_raw_skew_ticks": 13.574612661803894,
+      "gamma_min": 333.63620233425644,
+      "gamma_max": 514.4441001025879,
+      "spread_floor_fraction": 1.0
+    }
+  ],
+  "calibration_checks": {
+    "passed": true,
+    "reason": "both rounded inventory directions are visible",
+    "reference_horizon_variance": 3.806799194314115e-08,
+    "reference_horizon_sigma": 0.0001951102046104743,
+    "gamma_min": 151.65281924284383,
+    "gamma_max": 909.9169154570629,
+    "reference_long_raw_skew_ticks": -2.0
+  },
+  "capture_samples": 1224,
+  "replay_after_calibration": true,
+  "balances": "hypothetical CSV balances; no authenticated account",
+  "interpretation": "quote sensitivity with hypothetical inventory; no fills or PnL simulated"
+}
