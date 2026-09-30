@@ -1,5 +1,7 @@
 # Gate 永續合約 Avellaneda
 
+如要先模擬成交與損益、比較 gamma 並查看互動圖表，請使用[離線模擬器](avellaneda_perpetual_simulator.md)。
+
 這是新增的可設定策略腳本 `scripts/avellaneda_perpetual.py`，只支援
 `gate_io_perpetual` 的 USDT 線性永續合約、ONEWAY 單向持倉。
 使用標準 USDT 合約錢包；統一授信帳戶與 split-position 模式不受支援。

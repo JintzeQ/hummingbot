@@ -13,6 +13,7 @@ The Hummingbot codebase is free and publicly available under the Apache 2.0 open
 ## Quick Links
 
 * [Gate 永續合約 Avellaneda](docs/avellaneda_perpetual.md): 預設報價預覽、100 USDT 起始設定與風控說明
+* [Avellaneda 模擬交易與視覺化](docs/avellaneda_perpetual_simulator.md): 離線成交、反傭帳務、三種 gamma 比較與互動圖表
 * [Website and Docs](https://hummingbot.org): Official Hummingbot website and documentation
 * [Installation](https://hummingbot.org/installation/docker/): Install Hummingbot on various platforms
 * [Discord](https://discord.gg/hummingbot): The main gathering spot for the global Hummingbot community
