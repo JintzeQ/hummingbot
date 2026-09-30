@@ -1,0 +1,99 @@
+# 合約版 Avellaneda 執行驗證紀錄
+
+驗證日期：2026-09-30。設定為 100 USDT 假設本金、1 倍槓桿、單筆上限
+10 USDT、絕對淨持倉上限 40 USDT、計算預算 50 USDT、費用緩衝 5 USDT。
+Maker 0.02%、taker 0.05%、反傭 60% 是使用者提供的假設，沒有登入 Gate
+確認帳戶費率或反傭實際入帳。
+
+## 可重現的公開行情校準
+
+本分支保存 [公開行情 CSV](../examples/avellaneda_perpetual_validation/gate_btc_capture_20260930.csv)
+和 [校準與回放 JSON](../examples/avellaneda_perpetual_validation/report_20260930.json)。
+來源是 Gate 公開 USDT 永續合約規則及 top-of-book REST，不需要 API 金鑰。
+資料共 1,224 筆，UTC 05:06:39–05:32:13（台北 13:06:39–13:32:13），
+包含一段 306.37 秒的收集間隔。首次校準只用間隔之前連續有效的 902.01 秒，
+按整秒桶去重後 881 筆，不用之後的行情反向修正參考值。
+
+| 校準項目 | 結果 |
+| --- | --- |
+| 交易對 | BTC-USDT |
+| 參考中間價 | 83,238.65 USDT |
+| 價格 tick | 0.1 USDT |
+| 張數／最小量 | 0.0001 BTC，至少一張 |
+| 最小名目金額 | 1 USDT，依本分支 Gate 連接器規則 |
+| 真正第一張庫存 | 0.0001 BTC，參考名目 8.323865 USDT |
+| q_ref | 0.208096625，約占 40U 上限 20.8% |
+| v_ref | 1.26893306477 × 10⁻⁹ / 秒 |
+| 30 秒參考變異數 V_ref | 3.80679919431 × 10⁻⁸ |
+| 30 秒參考 sigma | 0.019511% |
+| gamma_base | 303.30563849 |
+| 自適應 gamma 範圍 | 約 151.65–909.92 |
+| 第一張多單報價差 | bid −2 ticks、ask −2 ticks |
+| 第一張空單報價差 | bid +2 ticks、ask +2 ticks |
+
+校準目標是參考條件下保留價格偏移兩個 tick；之後波動度改變，當時偏移
+不必仍是兩個 tick。此份報告是當次行情的敏感度示例，不是收益最適參數。
+程式預設校準 24 小時失效，交易規格或影響報價的設定不合也會失效。
+
+重現命令（輸出路徑須尚未存在）：
+
+```bash
+python tools/avellaneda_perpetual_calibrate.py \
+  --capture examples/avellaneda_perpetual_validation/gate_btc_capture_20260930.csv \
+  --report logs/avellaneda_reproduction.json \
+  --quotes logs/avellaneda_reproduction_quotes.csv \
+  --write-preview-config conf/scripts/conf_avellaneda_perpetual_reproduction.yml
+```
+
+## 相同行情的報價敏感度比較
+
+只比較校準完成後的行情，間隔後重新暖機；每組 287 筆有效觀測。
+每組使用相同交易規則、單量、持倉上限、費率和價差地板，並明示庫存是假設。
+數值是**保留價格的平均絕對偏移 tick**，不是成交收益，也不是最終委託價差：
+
+| 假設庫存 | 固定 gamma 1 | 校準固定 gamma | 自適應 gamma |
+| --- | ---: | ---: | ---: |
+| 零庫存 | 0 | 0 | 0 |
+| 多一張 | 0.00993 | 3.01193 | 3.45921 |
+| 空一張 | 0.00993 | 3.01194 | 3.45922 |
+| 多三張 | 0.02979 | 9.03575 | 13.57461 |
+
+本次所有比較都由 0.04% 最低完整價差生效。gamma 已影響中心偏移，但沒有
+改掉這個價差下限。回放沒有建立排隊、觸價成交、部分成交、延遲或資金費模型，
+所以不產生收益率或正期望結論。餘額欄位全是 100U 的假設值。
+
+## 程式與編譯執行
+
+| 檢查 | 結果 |
+| --- | --- |
+| 原有核心／adapter 測試及新增校準、限幅、40U 與 markout 測試 | 69 項通過 |
+| 完整 Gate 永續連接器測試目錄 | 87 項通過 |
+| 真正 Hummingbot Clock／ScriptStrategyBase／Gate 整合測試 | 3 項通過 |
+| Cython 模組 | 58 個編譯完成 |
+| flake8、isort、Python 語法與 git diff 空白檢查 | 通過 |
+
+核心 suite 保留原本明確 20U／30U 的測試情境，另外測試新的 40U／50U 設定，
+不藉改動舊斷言掩蓋回歸。新增測試包含 15 分鐘資料門檻、tick 可見性、零波動、
+資金／最小張數不足、規格失配、校準過期、整秒時間抖動、5 秒頻率、20% 平滑、
+±10% 限幅、上限、資料不可信時凍結，以及行情缺口暖機時撤掉舊單。
+
+整合 suite 使用真正的 compiled Clock、OrderBook、ScriptStrategyBase、Gate
+連接器和訂單／成交事件追蹤器，替換交易 transport 和網路就緒狀態。驗證了
+1,000 秒時鐘回放的預覽校準不呼叫任何 API、更改帳戶或建立委託；實際策略
+委託路由送出 post-only／reduce-only 欄位，成交重複事件去重、撤單終止事件
+回到引擎，以及緊急市場平倉使用 `reduce_only: true`、`tif: ioc`、`price: 0`。
+這些是本機帶 transport 替身的執行驗證，不是 Gate 已接受真實委託的證據。
+
+驗證環境 Python 3.12、Cython 3.0.12、gcc/g++；XRPL 依專案環境使用 4.1.0。
+HTTP 測試用 aiohttp 3.9.5、aioresponses 0.7.8，避免新版本 aiohttp 的
+`stream_writer` 建構參數與舊測試替身衝突。原有 Gate suite 會留下未匹配的
+mock 背景連線警告，但全部 87 項測試斷言通過；新增三項整合測試不啟動真實網路。
+
+## 尚未完成的實盤驗證
+
+沒有使用你的 Gate API、沒有更改真實帳戶模式或槓桿、沒有下單或合併 master。
+實際費率、反傭入帳、資金費歸因、排隊成交、API 延遲和長期盈虧仍待帳戶驗證。
+`actual_fee_quote` 保存成交事件回報費用，估計反傭與已入帳金額分欄；無法獨立
+確認的入帳反傭為 null。錢包權益已包含實際現金流，不能再把估計反傭加進停損權益。
+原連接器 funding-payment 查詢尚為空實作，因此記錄明示歸因不完整。
+PnL 線上學習仍列為後續功能。預設及匯出設定均維持 `dry_run: true`。

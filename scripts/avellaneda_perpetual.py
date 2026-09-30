@@ -1,8 +1,10 @@
 """Configurable Gate USDT perpetual Avellaneda market maker (preview by default)."""
 
 import asyncio
+import json
 import time
 from decimal import Decimal
+from pathlib import Path
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.derivative.gate_io_perpetual import gate_io_perpetual_constants as GATE
@@ -37,6 +39,8 @@ class AvellanedaPerpetual(ScriptStrategyBase):
         self._stopping = False
         self._last_logged_halt = None
         self._halt_position_acknowledged = False
+        self._last_metrics_at = float("-inf")
+        self._exported_calibration_at = None
 
     @property
     def exchange(self):
@@ -74,6 +78,10 @@ class AvellanedaPerpetual(ScriptStrategyBase):
 
     async def _configure_live_inner(self):
         ex, c = self.exchange, self.settings
+        if c.gamma_mode == "adaptive":
+            error = self.engine.gamma.compatibility_error(self._snapshot())
+            if error:
+                raise ValueError(error)
         account = await ex._api_get(
             path_url=GATE.USER_BALANCES_PATH_URL, is_auth_required=True, limit_id=GATE.USER_BALANCES_PATH_URL)
         if (not isinstance(account, dict) or str(account.get("enable_credit", False)).lower() == "true"
@@ -194,6 +202,7 @@ class AvellanedaPerpetual(ScriptStrategyBase):
                 self._account_task = asyncio.create_task(self._refresh_account())
         try:
             self._execute(self.engine.step(self._snapshot()))
+            self._log_metrics()
         except Exception as exc:
             self.engine.halt(f"snapshot/quote error: {exc}")
             self._execute(self.engine._cancel_all(self.current_timestamp))
@@ -203,7 +212,52 @@ class AvellanedaPerpetual(ScriptStrategyBase):
 
     def did_fill_order(self, event):
         self._halt_position_acknowledged = False
+        key = (event.order_id, event.exchange_trade_id)
+        already_seen = key in self.engine.seen_fills
         self.engine.filled(event.order_id, event.amount, event.timestamp, event.exchange_trade_id)
+        if not already_seen and key in self.engine.seen_fills and hasattr(event, "price"):
+            # Preserve the event's reported fees; do not substitute the rebate
+            # estimate for a credited cash flow. Unavailable conversion stays null.
+            fee_quote = None
+            try:
+                if hasattr(event, "trade_fee"):
+                    value = event.trade_fee.fee_amount_in_token(
+                        self.settings.trading_pair, event.price, event.amount, "USDT", self.exchange)
+                    if value.is_finite():
+                        fee_quote = str(value)
+            except Exception:
+                pass
+            row = self.engine.record_fill_metrics(
+                event.order_id, event.exchange_trade_id, event.timestamp, event.amount, event.price, fee_quote)
+            if row is not None:
+                self.logger().info("AVELLANEDA_FILL " + json.dumps(row, sort_keys=True))
+
+    def _export_calibration(self, profile):
+        directory = Path(__file__).resolve().parents[1] / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"avellaneda_gamma_{self.settings.trading_pair}_{int(profile.created_at * 1000)}.json"
+        # Contains market observations and strategy settings, never API keys.
+        with path.open("x") as stream:
+            stream.write(profile.model_dump_json(indent=2) + "\n")
+        self.logger().info(f"Gamma calibration exported: {path}")
+
+    def _log_metrics(self):
+        profile = self.engine.gamma.profile
+        if (self.settings.dry_run and profile is not None
+                and profile.created_at != self._exported_calibration_at):
+            self._exported_calibration_at = profile.created_at
+            try:
+                self._export_calibration(profile)
+            except Exception as exc:
+                self.logger().error(f"Calibration export failed: {exc}; report remains in status")
+        if self.current_timestamp - self._last_metrics_at >= self.settings.gamma_update_seconds:
+            self._last_metrics_at = self.current_timestamp
+            if self.engine.metrics:
+                row = dict(self.engine.metrics, logged_at=self.current_timestamp,
+                           status=self.engine.status, gamma_reason=self.engine.gamma.reason)
+                self.logger().info("AVELLANEDA_METRICS " + json.dumps(row, sort_keys=True))
+        while self.engine.completed_markouts:
+            self.logger().info("AVELLANEDA_MARKOUT " + json.dumps(self.engine.completed_markouts.popleft(), sort_keys=True))
 
     def did_cancel_order(self, event):
         self.engine.terminal(event.order_id)
@@ -252,6 +306,19 @@ class AvellanedaPerpetual(ScriptStrategyBase):
                 f"Variance/s: {e.variance:.8g} | reservation: {e.reservation_price} | full spread: {e.spread}",
                 f"Net maker: {c.maker_fee * (1 - c.rebate_rate):.6%} | cost floor: {c.fee_floor:.6%}",
                 f"Own unresolved orders: {len(e.orders)} | emergency attempts: {e.close_attempts}"]
+        rows.extend([f"Gamma {c.gamma_mode}: base={e.gamma.base:.8g}, current={e.gamma.current:.8g}, "
+                     f"target={e.gamma.target:.8g}, bounds={e.gamma.bounds} | {e.gamma.reason}",
+                     f"Calibration: {e.calibration_reason}"])
+        if e.metrics:
+            m = e.metrics
+            rows.append(f"Observed at {m['timestamp']}: inventory q={m['inventory_ratio']:.4f} | "
+                        f"remaining lots={m['remaining_capacity_lots']} | "
+                        f"raw skew={m['raw_skew_ticks']:.4f} ticks | rounded={m['rounded_skew_ticks']} | "
+                        f"spread floor active={m['spread_floor_active']}")
+        if e.gamma.profile:
+            p = e.gamma.profile
+            rows.append(f"Calibration reference: {p.reference_mid}, first lot={p.reference_amount}, "
+                        f"q={p.reference_inventory:.4f}, variance/s={p.variance_per_second:.8g}, at={p.created_at}")
         if e.halt_reason:
             rows.append(f"HALTED: {e.halt_reason}")
         rows.extend(f"Preview {q.side}: {q.amount} @ {q.price} ({'reduce-only' if q.close else 'open'})"

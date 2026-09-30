@@ -14,7 +14,11 @@ def snapshot(timestamp=0, **overrides):
 
 
 def engine(**overrides):
-    return AvellanedaEngine(AvellanedaSettings(dry_run=False, warmup_samples=3, **overrides))
+    # Retain the original 20U scenarios as regression coverage after defaults
+    # move to 40U. New-default risk boundaries are tested separately.
+    values = dict(dry_run=False, warmup_samples=3, max_position_quote=D("20"), capital_budget_quote=D("30"))
+    values.update(overrides)
+    return AvellanedaEngine(AvellanedaSettings(**values))
 
 
 def warmed(**overrides):
@@ -37,7 +41,7 @@ class ModelTests(unittest.TestCase):
                        {"rebate_rate": D("1.01")}, {"connector": "binance_perpetual"},
                        {"trading_pair": "BTC-USD"}, {"warmup_samples": 201},
                        {"capital_budget_quote": D("1")}, {"max_spread": D("0.0001")},
-                       {"order_amount_quote": D("30")}):
+                       {"order_amount_quote": D("41")}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValidationError):
                 AvellanedaSettings(**kwargs)
 

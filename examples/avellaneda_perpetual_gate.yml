@@ -5,11 +5,26 @@ connector: gate_io_perpetual
 trading_pair: BTC-USDT
 dry_run: true
 leverage: 1
-capital_budget_quote: "30"
+capital_budget_quote: "50"
 order_amount_quote: "10"
-max_position_quote: "20"
+max_position_quote: "40"
 available_balance_reserve: "5"
 risk_factor: 1.0
+# Fixed mode keeps risk_factor. Adaptive preview collects a continuous 15-minute
+# calibration; live adaptive mode requires exporting a matching calibration.
+gamma_mode: adaptive
+gamma_calibration: null
+calibration_seconds: 900.0
+calibration_target_ticks: 2.0
+calibration_max_age_seconds: 86400.0
+gamma_update_seconds: 5.0
+gamma_smoothing: 0.2
+gamma_max_step: 0.1
+gamma_min_ratio: 0.5
+gamma_max_ratio: 3.0
+gamma_inventory_weight: 1.0
+gamma_volatility_weight: 0.5
+gamma_max_volatility_multiplier: 2.0
 kappa: 10000.0
 horizon_seconds: 30.0
 # Full bid/ask spread floor = 0.04%, not 0.04% on each side.
