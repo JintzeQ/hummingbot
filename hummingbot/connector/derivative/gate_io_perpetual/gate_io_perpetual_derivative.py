@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -13,6 +15,10 @@ from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_api_ord
     GateIoPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_auth import GateIoPerpetualAuth
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import (
+    GateRequestDeferred,
+    GateRequestGuard,
+)
 from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_user_stream_data_source import (
     GateIoPerpetualAPIUserStreamDataSource,
 )
@@ -66,10 +72,20 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         self._position_mode = None
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self.request_guard = None
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
         self._real_time_balance_update = False
+
+    def enable_request_guard(self, settings):
+        if self.request_guard is None:
+            account = hashlib.sha256(self._gate_io_perpetual_user_id.encode()).hexdigest()[:16]
+            journal = Path(__file__).resolve().parents[4] / "logs" / f"gate_requests_{account}.jsonl"
+            self.request_guard = GateRequestGuard(
+                per_second=settings.requests_per_second, safety_per_second=settings.safety_requests_per_second,
+                daily=settings.requests_per_24h, safety_daily=settings.safety_requests_per_24h, journal=journal)
+        return self.request_guard
 
     @property
     def authenticator(self):
@@ -185,7 +201,8 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
             throttler=self._throttler,
-            auth=self._auth)
+            auth=self._auth,
+            guard_provider=lambda: self.request_guard)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         return GateIoPerpetualAPIOrderBookDataSource(
@@ -319,12 +336,13 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         # the underlying aiohttp will encode it to params
         data = data
         endpoint = CONSTANTS.ORDER_CREATE_PATH_URL
-        order_result = await self._api_post(
-            path_url=endpoint,
-            data=data,
-            is_auth_required=True,
-            limit_id=endpoint,
-        )
+        try:
+            order_result = await self._api_post(
+                path_url=endpoint, data=data, is_auth_required=True, limit_id=endpoint)
+        except GateRequestDeferred:
+            if self.request_guard:
+                self.request_guard.deferred_orders.add(order_id)
+            raise
         if order_result.get('finish_as') in {"cancelled", "expired", "failed", "ioc"}:
             raise IOError({"label": "ORDER_REJECTED", "message": "Order rejected."})
         exchange_order_id = str(order_result["id"])
@@ -337,11 +355,14 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         """
         canceled = False
         exchange_order_id = await tracked_order.get_exchange_order_id()
-        resp = await self._api_delete(
-            path_url=CONSTANTS.ORDER_DELETE_PATH_URL.format(id=exchange_order_id),
-            is_auth_required=True,
-            limit_id=CONSTANTS.ORDER_DELETE_LIMIT_ID,
-        )
+        try:
+            resp = await self._api_delete(
+                path_url=CONSTANTS.ORDER_DELETE_PATH_URL.format(id=exchange_order_id),
+                is_auth_required=True, limit_id=CONSTANTS.ORDER_DELETE_LIMIT_ID)
+        except GateRequestDeferred:
+            if self.request_guard:
+                self.request_guard.deferred_cancels.add(order_id)
+            raise
         canceled = resp.get("finish_as") == "cancelled"
         return canceled
 

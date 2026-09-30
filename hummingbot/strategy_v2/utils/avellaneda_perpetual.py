@@ -65,6 +65,11 @@ class AvellanedaSettings(BaseModel):
     volatility_samples: int = setting(200, ge=10, le=10000)
     warmup_samples: int = setting(20, ge=3)
     refresh_seconds: float = setting(5.0, gt=0)
+    max_order_age_seconds: float = setting(30.0, gt=0)
+    requests_per_second: int = setting(6, ge=2, le=20)
+    safety_requests_per_second: int = setting(2, ge=1)
+    requests_per_24h: int = setting(50000, ge=100, le=80000)
+    safety_requests_per_24h: int = setting(1000, ge=10)
     stale_seconds: float = setting(10.0, gt=0)
     reconciliation_timeout: float = setting(15.0, gt=0)
     cancel_timeout: float = setting(10.0, gt=0)
@@ -82,6 +87,12 @@ class AvellanedaSettings(BaseModel):
                 raise ValueError(f"{name} must be finite")
         if self.warmup_samples > self.volatility_samples:
             raise ValueError("warmup_samples must not exceed volatility_samples")
+        if self.max_order_age_seconds < self.refresh_seconds:
+            raise ValueError("max_order_age_seconds must cover refresh_seconds")
+        if self.safety_requests_per_second >= self.requests_per_second:
+            raise ValueError("Leave a positive per-second quote request budget")
+        if self.safety_requests_per_24h >= self.requests_per_24h:
+            raise ValueError("Leave a positive daily quote request budget")
         if self.order_amount_quote > self.max_position_quote:
             raise ValueError("order_amount_quote must not exceed max_position_quote")
         if self.max_position_quote / self.leverage > self.capital_budget_quote:
@@ -216,6 +227,16 @@ class AvellanedaEngine:
         self.metrics = {}
         self.markouts = []
         self.completed_markouts = deque(maxlen=1000)
+        self.request_guard = None
+        self.retained_quotes = 0
+        self.last_quote_check = -math.inf
+
+    def sync_deferred_cancels(self):
+        if self.request_guard:
+            for order_id in self.request_guard.deferred_cancels:
+                if order_id in self.orders:
+                    self.orders[order_id].cancel_at = None
+            self.request_guard.deferred_cancels.clear()
 
     def observe(self, s: Snapshot):
         if self.samples and s.timestamp - self.samples[-1][0] > self.config.stale_seconds:
@@ -338,11 +359,15 @@ class AvellanedaEngine:
             raise ValueError("order ID must be unique and nonempty")
         self.orders[order_id] = WorkingOrder(quote, quote.amount, timestamp)
         self.known_orders[order_id] = quote
+        if self.request_guard and not quote.market:
+            self.request_guard.pending_quotes[order_id] = (self.request_guard.generation, self.request_guard.clock())
         if quote.market:
             self.close_attempts += 1
 
     def terminal(self, order_id: str, failed=False, timestamp=0.0):
         order = self.orders.pop(order_id, None)
+        if self.request_guard:
+            self.request_guard.pending_quotes.pop(order_id, None)
         if order is not None and order.quote.market:
             # A market order's completion event is not a fresh position snapshot.
             self.rest_ack_required = True
@@ -382,6 +407,10 @@ class AvellanedaEngine:
         self.preview = []
 
     def _cancel_all(self, now: float) -> list[Command]:
+        self.sync_deferred_cancels()
+        if self.request_guard and not self.request_guard.allowed(
+                "DELETE", "futures/usdt/orders", trading=True, safety=True):
+            return []
         commands = []
         for order_id, order in self.orders.items():
             if order.quote.market:
@@ -397,6 +426,11 @@ class AvellanedaEngine:
         c = self.config
         self.preview = []
         self.gamma.reason = "frozen: market/account data, reconciliation, warmup or halt"
+        self.sync_deferred_cancels()
+        if self.request_guard:
+            reason = self.request_guard.quote_reason()
+            if "24h" in reason or "journal" in reason:
+                self.halt(reason)
         if not s.valid:
             self.status = "invalid market/account data; quotes paused"
             return [] if c.dry_run else self._cancel_all(s.timestamp)
@@ -436,6 +470,10 @@ class AvellanedaEngine:
             if amount <= 0:
                 self.status += "; flat" if s.position == 0 else "; residual dust needs manual review"
             elif self.close_attempts < c.max_close_attempts:
+                if self.request_guard and not self.request_guard.allowed(
+                        "POST", "futures/usdt/orders", trading=True, safety=True):
+                    self.status += "; emergency close waiting for request cooldown"
+                    return commands
                 commands.append(Command("create", quote=Quote(
                     "sell" if s.position > 0 else "buy", amount, s.mid, close=True, market=True)))
             else:
@@ -443,6 +481,12 @@ class AvellanedaEngine:
             return commands
         if not fresh:
             self.status = "connector/book stale; quotes paused"
+            return [] if c.dry_run else self._cancel_all(s.timestamp)
+        if self.request_guard and self.request_guard.quote_reason():
+            reason = self.request_guard.quote_reason()
+            self.status = "quotes paused: " + reason
+            if reason == "local quote requests/second limit":
+                return []  # A short local quote pause does not require healthy quotes to be cancelled.
             return [] if c.dry_run else self._cancel_all(s.timestamp)
         self.observe(s)
         if self.expected_position is not None:
@@ -480,12 +524,23 @@ class AvellanedaEngine:
         if c.dry_run:
             return []
         if self.orders:
-            due = any(o.cancel_at is not None or s.timestamp - o.created_at >= c.refresh_seconds
-                      for o in self.orders.values())
-            if self.inventory_changed or not self.preview or due:
+            pending = any(o.cancel_at is not None for o in self.orders.values())
+            expired = any(s.timestamp - o.created_at >= c.max_order_age_seconds for o in self.orders.values())
+            due = s.timestamp - self.last_quote_check >= c.refresh_seconds
+            if self.inventory_changed or not self.preview or pending or expired:
                 return self._cancel_all(s.timestamp)
+            if due:
+                self.last_quote_check = s.timestamp
+                working = sorted((o.quote.side, o.remaining, o.quote.price, o.quote.close, o.quote.market)
+                                 for o in self.orders.values())
+                proposed = sorted((q.side, q.amount, q.price, q.close, q.market) for q in self.preview)
+                if working != proposed:
+                    return self._cancel_all(s.timestamp)
+                self.retained_quotes += len(self.orders)
+                self.status = "quoting; unchanged quotes retained"
             return []
         self.inventory_changed = False
+        self.last_quote_check = s.timestamp
         return [Command("create", quote=q) for q in self.preview]
 
     def accept_rest_position(self, position: Decimal):

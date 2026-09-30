@@ -144,7 +144,7 @@ class LifecycleTests(unittest.TestCase):
         commands = e.step(snapshot(3))
         for i, command in enumerate(commands):
             e.register(str(i), command.quote, 3)
-        self.assertEqual(["cancel", "cancel"], [x.kind for x in e.step(snapshot(8))])
+        self.assertEqual(["cancel", "cancel"], [x.kind for x in e.step(snapshot(8, bid=D("99.98"), ask=D("100.00")))])
         self.assertEqual([], e.step(snapshot(9)))
         e.terminal("0")
         self.assertEqual([], e.step(snapshot(10)))

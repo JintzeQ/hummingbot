@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 import hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_constants as CONSTANTS
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
+from hummingbot.core.web_assistant.rest_post_processors import RESTPostProcessorBase
+from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -27,12 +29,37 @@ def private_rest_url(endpoint: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
 
 def build_api_factory(
         throttler: Optional[AsyncThrottler] = None,
-        auth: Optional[AuthBase] = None) -> WebAssistantsFactory:
+        auth: Optional[AuthBase] = None,
+        guard_provider=None) -> WebAssistantsFactory:
     throttler = throttler or create_throttler()
     api_factory = WebAssistantsFactory(
         throttler=throttler,
-        auth=auth)
+        auth=auth,
+        rest_pre_processors=[GateGuardPreProcessor(guard_provider)] if guard_provider else [],
+        rest_post_processors=[GateGuardPostProcessor(guard_provider)] if guard_provider else [])
     return api_factory
+
+
+class GateGuardPreProcessor(RESTPreProcessorBase):
+    def __init__(self, provider):
+        self.provider = provider
+
+    async def pre_process(self, request):
+        guard = self.provider()
+        if guard:
+            guard.before_request(request.method.value, request.url, request.data)
+        return request
+
+
+class GateGuardPostProcessor(RESTPostProcessorBase):
+    def __init__(self, provider):
+        self.provider = provider
+
+    async def post_process(self, response):
+        guard = self.provider()
+        if guard:
+            guard.after_response(response.method.value, response.url, response.status, response.headers)
+        return response
 
 
 def create_throttler() -> AsyncThrottler:

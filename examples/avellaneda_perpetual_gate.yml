@@ -37,6 +37,12 @@ rebate_rate: "0.6"
 volatility_samples: 200
 warmup_samples: 20
 refresh_seconds: 5.0
+# Refresh evaluates quotes; identical price/remaining amount/action keeps queue priority.
+max_order_age_seconds: 30.0
+requests_per_second: 6
+safety_requests_per_second: 2
+requests_per_24h: 50000
+safety_requests_per_24h: 1000
 stale_seconds: 10.0
 reconciliation_timeout: 15.0
 cancel_timeout: 10.0

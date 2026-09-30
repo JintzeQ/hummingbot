@@ -7,6 +7,7 @@ import asyncio
 import math
 import unittest
 from decimal import Decimal as D
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 from bidict import bidict
@@ -14,22 +15,121 @@ from bidict import bidict
 from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_derivative import (
     GateIoPerpetualDerivative as Gate,
 )
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import (
+    GateRequestDeferred,
+    GateRequestGuard,
+)
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
-from hummingbot.core.data_type.common import PositionSide, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.strategy_v2.utils.avellaneda_perpetual import Command, Quote
 from scripts.avellaneda_perpetual import AvellanedaPerpetual, AvellanedaPerpetualConfig
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actual_rest_boundary_counts_429_and_defers_until_reset(self):
+        s, ex, book = self.setup_strategy(dry_run=False)
+        now = [1700000000.0]
+        ex.request_guard.clock = lambda: now[0]
+        assistant = await ex._web_assistants_factory.get_rest_assistant()
+        response = SimpleNamespace(method=RESTMethod.POST,
+                                   url="https://api.gateio.ws/api/v4/futures/usdt/orders",
+                                   status=429, headers={"X-Gate-RateLimit-Reset-Timestamp": str(now[0] + 20)},
+                                   json=AsyncMock(return_value={"id": "123"}), text=AsyncMock(return_value="limited"))
+        try:
+            with patch.object(ex._web_assistants_factory, "get_rest_assistant", AsyncMock(return_value=assistant)), \
+                    patch.object(assistant._connection, "call", AsyncMock(return_value=response)) as transport:
+                args = ("t-HBOT-guard", "BTC-USDT", D("0.0001"), TradeType.BUY,
+                        OrderType.LIMIT_MAKER, D("79900"))
+                with self.assertRaises(GateRequestDeferred):
+                    await ex._place_order(*args, position_action=PositionAction.OPEN)
+                self.assertIn("t-HBOT-guard", ex.request_guard.deferred_orders)
+                self.assertEqual(1, ex.request_guard.stats()["requests_24h"])
+                self.assertEqual(1, transport.await_count)
+                with self.assertRaises(GateRequestDeferred):
+                    await ex._place_order(*args, position_action=PositionAction.OPEN)
+                self.assertEqual(1, transport.await_count)
+                self.assertEqual(1, ex.request_guard.stats()["requests_24h"])
+                now[0] += 21
+                response.status, response.headers = 201, {}
+                result = await ex._place_order(*args, position_action=PositionAction.OPEN)
+                self.assertEqual("123", result[0])
+                self.assertEqual(2, transport.await_count)
+                self.assertEqual(2, ex.request_guard.stats()["requests_24h"])
+        finally:
+            await ex._web_assistants_factory.close()
+
+    async def test_429_failure_event_does_not_escalate_or_consume_emergency_attempt(self):
+        s, ex, book = self.setup_strategy(dry_run=False)
+        assistant = await ex._web_assistants_factory.get_rest_assistant()
+        response = SimpleNamespace(method=RESTMethod.POST,
+                                   url="https://api.gateio.ws/api/v4/futures/usdt/orders",
+                                   status=429, headers={"Retry-After": "10"},
+                                   json=AsyncMock(), text=AsyncMock(return_value="limited"))
+        try:
+            with patch.object(Gate, "ready", new_callable=PropertyMock, return_value=True), \
+                    patch.object(ex._web_assistants_factory, "get_rest_assistant", AsyncMock(return_value=assistant)), \
+                    patch.object(assistant._connection, "call", AsyncMock(return_value=response)) as transport:
+                clock = Clock(ClockMode.BACKTEST, 1, 0, 100)
+                clock.add_iterator(s)
+                clock.backtest_til(1)
+                ex._set_current_timestamp(1)
+                s.engine.halt("test loss")
+                quote = Quote("sell", D("0.0001"), D("80000"), close=True, market=True)
+                s._execute([Command("create", quote=quote)])
+                for _ in range(100):
+                    await asyncio.sleep(0)
+                    if transport.await_count and not s.engine.orders:
+                        break
+                self.assertEqual(1, transport.await_count)
+                self.assertEqual({}, s.engine.orders)
+                self.assertEqual(0, s.engine.failures)
+                self.assertEqual(0, s.engine.close_attempts)
+                self.assertTrue(s.engine.rest_ack_required)
+                self.assertEqual(1, ex.request_guard.rate_limited)
+        finally:
+            await ex._web_assistants_factory.close()
+
+    async def test_actual_cancel_429_preserves_working_order_until_retry_ack(self):
+        s, ex, book = self.setup_strategy(dry_run=False)
+        now = [1700000000.0]
+        ex.request_guard.clock = lambda: now[0]
+        assistant = await ex._web_assistants_factory.get_rest_assistant()
+        response = SimpleNamespace(method=RESTMethod.DELETE,
+                                   url="https://api.gateio.ws/api/v4/futures/usdt/orders/123",
+                                   status=429, headers={"Retry-After": "20"},
+                                   json=AsyncMock(return_value={"finish_as": "cancelled"}), text=AsyncMock())
+        tracked = SimpleNamespace(get_exchange_order_id=AsyncMock(return_value="123"))
+        s.engine.register("order", Quote("buy", D("0.0001"), D("79000")), 1)
+        s.engine._cancel_all(2)
+        try:
+            with patch.object(ex._web_assistants_factory, "get_rest_assistant", AsyncMock(return_value=assistant)), \
+                    patch.object(assistant._connection, "call", AsyncMock(return_value=response)) as transport:
+                with self.assertRaises(GateRequestDeferred):
+                    await ex._place_cancel("order", tracked)
+                s.engine.sync_deferred_cancels()
+                self.assertIsNone(s.engine.orders["order"].cancel_at)
+                self.assertEqual([], s.engine._cancel_all(15))
+                self.assertIsNone(s.engine.halt_reason)
+                self.assertEqual(1, transport.await_count)
+                now[0] += 21
+                response.status, response.headers = 200, {}
+                self.assertTrue(await ex._place_cancel("order", tracked))
+                self.assertEqual(2, ex.request_guard.total_attempts)
+                self.assertEqual(2, transport.await_count)
+        finally:
+            await ex._web_assistants_factory.close()
+
     def setup_strategy(self, **settings):
         ex = Gate("dummy-key", "dummy-secret", "dummy-id", trading_pairs=["BTC-USDT"], trading_required=False)
+        ex.request_guard = GateRequestGuard()  # Test transport only; no persistent account journal.
         ex._account_balances["USDT"] = D("100")
         ex._account_available_balances["USDT"] = D("100")
         ex._trading_rules["BTC-USDT"] = TradingRule(

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Tuple
 from unittest.mock import AsyncMock
 
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import GateRequestDeferred
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -26,7 +27,7 @@ def load_place_order():
     method = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef)
                   and node.name == "_place_order")
     namespace = {"Decimal": Decimal, "Tuple": Tuple, "OrderType": OrderType,
-                 "TradeType": TradeType, "PositionAction": PositionAction,
+                 "TradeType": TradeType, "PositionAction": PositionAction, "GateRequestDeferred": GateRequestDeferred,
                  "CONSTANTS": SimpleNamespace(ORDER_CREATE_PATH_URL="futures/usdt/orders")}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["_place_order"]

@@ -13,6 +13,10 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import (
+    GateRequestDeferred,
+    GateRequestGuard,
+)
 from hummingbot.strategy_v2.utils.avellaneda_perpetual import Quote
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -106,6 +110,7 @@ def connector():
 
     return SimpleNamespace(
         ready=True, account_positions={}, in_flight_orders={},
+        enable_request_guard=lambda settings: GateRequestGuard(),
         _api_get=AsyncMock(side_effect=api_get),
         _trading_pair_position_mode_set=AsyncMock(return_value=(True, "")),
         _set_trading_pair_leverage=AsyncMock(return_value=(True, "")),
@@ -235,6 +240,14 @@ class ScriptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await s._refresh_account(acknowledge=True))
         self.assertFalse(s._halt_position_acknowledged)
         self.assertIn("account refresh failed", s.engine.halt_reason)
+
+    async def test_rate_limited_account_refresh_is_temporary_and_never_acknowledges(self):
+        s = strategy(dry_run=False)
+        s.exchange._update_positions.side_effect = GateRequestDeferred("cooldown")
+        self.assertFalse(await s._refresh_account(acknowledge=True))
+        self.assertFalse(s._halt_position_acknowledged)
+        self.assertIsNone(s.engine.halt_reason)
+        self.assertEqual(0, s._last_account_at)
 
     async def test_flat_stop_no_order(self):
         s = strategy(dry_run=False)

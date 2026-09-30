@@ -66,9 +66,9 @@ python tools/avellaneda_perpetual_calibrate.py \
 
 | 檢查 | 結果 |
 | --- | --- |
-| 原有核心／adapter 測試及新增校準、限幅、40U 與 markout 測試 | 69 項通過 |
+| 核心／adapter、校準、限幅、40U、markout、模擬及 API 保護測試 | 108 項通過 |
 | 完整 Gate 永續連接器測試目錄 | 87 項通過 |
-| 真正 Hummingbot Clock／ScriptStrategyBase／Gate 整合測試 | 3 項通過 |
+| 真正 Hummingbot Clock／ScriptStrategyBase／Gate 整合測試 | 6 項通過 |
 | Cython 模組 | 58 個編譯完成 |
 | 正式 TradingCore 策略／設定載入器 | 校準後 adaptive 預覽 YAML 載入成功，確認 40U／50U 及 gamma 校準資料 |
 | flake8、isort、Python 語法與 git diff 空白檢查 | 通過 |
@@ -88,7 +88,7 @@ python tools/avellaneda_perpetual_calibrate.py \
 驗證環境 Python 3.12、Cython 3.0.12、gcc/g++；XRPL 依專案環境使用 4.1.0。
 HTTP 測試用 aiohttp 3.9.5、aioresponses 0.7.8，避免新版本 aiohttp 的
 `stream_writer` 建構參數與舊測試替身衝突。原有 Gate suite 會留下未匹配的
-mock 背景連線警告，但全部 87 項測試斷言通過；新增三項整合測試不啟動真實網路。
+mock 背景連線警告，但全部 87 項測試斷言通過；新增六項整合測試不啟動真實網路。
 
 另補齊隔離環境的 UI、MQTT 與技術指標依賴，透過正式
 `TradingCore.load_script_class` 識別 `AvellanedaPerpetual`，載入工具匯出的
@@ -105,3 +105,17 @@ prompt_toolkit 3.0.51、paho-mqtt 2.1.0，沒有改動專案的依賴設定。
 確認的入帳反傭為 null。錢包權益已包含實際現金流，不能再把估計反傭加進停損權益。
 原連接器 funding-payment 查詢尚為空實作，因此記錄明示歸因不完整。
 PnL 線上學習仍列為後續功能。預設及匯出設定均維持 `dry_run: true`。
+
+## API 保護追加驗證
+
+新增實際 RESTAssistant pre/post-processor 路徑測試，以 transport 替身回覆 429，
+驗證 reset header 保留、送出失敗計數、冷卻時完全不呼叫 transport、重置後恢復、
+撤單 429 保留追蹤以及真實 FAILED 事件不消耗緊急減倉次數。
+純核心測試涵蓋每日與每秒保留容量、秒／毫秒 reset、伺服器時差、退避、
+剩餘 0、失敗請求、日誌重啟與程序鎖、日誌損壞及磁碟寫入失敗、過期排隊報價、
+未變報價保留、部分成交、撤單冷卻與每日額度停止平倉。
+
+介面已檢查 429 注入、冷卻計數、低每日額度停機、JSON／CSV 匯出與離線 HTML，
+桌面及 768／390／320px 沒有整頁水平溢出。兩份範例互動 HTML 已依新生命週期重算；
+舊策略的模擬成交和損益不能直接當成新版本的結果。
+實盤 API、真實反傭或盈利未驗證，預設仍為 dry_run。

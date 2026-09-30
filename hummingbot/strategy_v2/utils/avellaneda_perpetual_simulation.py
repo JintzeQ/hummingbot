@@ -17,6 +17,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import (
+    GateRequestDeferred,
+    GateRequestGuard,
+)
 from hummingbot.strategy_v2.utils.avellaneda_perpetual import (
     AvellanedaEngine,
     AvellanedaSettings,
@@ -53,6 +57,14 @@ class SimulationSettings(BaseModel):
     market_slippage_bps: D = Field(D("1"), ge=0, le=50)
     volatility_bps: float = Field(0.75, ge=0.05, le=3)
     funding_rate_8h: D = Field(D("0"), ge=D("-0.01"), le=D("0.01"))
+    refresh_seconds: float = Field(5, ge=1, le=30)
+    max_order_age_seconds: float = Field(30, ge=5, le=300)
+    requests_per_second: int = Field(6, ge=3, le=20)
+    safety_requests_per_second: int = Field(2, ge=1, le=10)
+    requests_per_24h: int = Field(50000, ge=100, le=80000)
+    safety_requests_per_24h: int = Field(1000, ge=10, le=10000)
+    simulated_429_after_seconds: float = Field(0, ge=0, le=7200)
+    simulated_429_cooldown_seconds: float = Field(10, ge=1, le=60)
     max_session_loss_quote: D = Field(D("1"), gt=0, le=1000)
 
     @model_validator(mode="after")
@@ -72,7 +84,9 @@ class SimulationSettings(BaseModel):
     def strategy(self, **changes):
         values = {name: getattr(self, name) for name in (
             "max_position_quote", "capital_budget_quote", "order_amount_quote", "min_spread",
-            "maker_fee", "taker_fee", "rebate_rate", "max_session_loss_quote")}
+            "maker_fee", "taker_fee", "rebate_rate", "max_session_loss_quote", "refresh_seconds",
+            "max_order_age_seconds", "requests_per_second", "safety_requests_per_second",
+            "requests_per_24h", "safety_requests_per_24h")}
         values.update(changes)
         return AvellanedaSettings(**values)
 
@@ -180,6 +194,12 @@ class PaperBroker:
         self.fills = []
         self.event_log = []
         self.max_abs_position_quote = ZERO
+        self.now = 0.0
+        self.first_request_at = None
+        self.injected_429 = False
+        engine.request_guard = GateRequestGuard(
+            settings.requests_per_second, settings.safety_requests_per_second,
+            settings.requests_per_24h, settings.safety_requests_per_24h, clock=lambda: self.now)
 
     def schedule(self, timestamp, kind, payload):
         self.sequence += 1
@@ -196,11 +216,32 @@ class PaperBroker:
                     for oid, o in self.orders.items() if oid != excluding), ZERO)
 
     def snapshot(self, market):
+        self.now = market.timestamp
         available = max(ZERO, min(self.wallet, self.equity(market.mid)) - abs(self.position) * market.mid - self.reserved())
         return replace(market, position=self.visible_position, available=available, equity=self.equity(market.mid))
 
     def dispatch(self, commands, market):
+        self.now = market.timestamp
         for command in commands:
+            guard = self.engine.request_guard
+            q = command.quote
+            method = "POST" if command.kind == "create" else "DELETE"
+            data = dict(reduce_only=q.close, price="0" if q.market else str(q.price)) if q else None
+            try:
+                guard.before_request(method, "futures/usdt/orders", data)
+                if self.first_request_at is None:
+                    self.first_request_at = market.timestamp
+                if (method == "POST" and not q.market and not self.injected_429
+                        and self.settings.simulated_429_after_seconds > 0
+                        and market.timestamp - self.first_request_at >= self.settings.simulated_429_after_seconds):
+                    self.injected_429 = True
+                    self.event_log.append(dict(timestamp=market.timestamp, kind="http_429"))
+                    guard.after_response(method, "futures/usdt/orders", 429,
+                                         {"Retry-After": str(self.settings.simulated_429_cooldown_seconds)})
+            except GateRequestDeferred:
+                if command.kind == "cancel":
+                    guard.deferred_cancels.add(command.order_id)
+                continue
             if command.kind == "create":
                 self.order_count += 1
                 oid = f"paper-{self.order_count}"
@@ -222,6 +263,7 @@ class PaperBroker:
                 self.schedule(now + self.settings.position_latency_seconds, "rest", None)
 
     def process_events(self, market):
+        self.now = market.timestamp
         while self.events and self.events[0][0] <= market.timestamp:
             _, _, kind, payload = heapq.heappop(self.events)
             order = self.orders.get(payload) if kind in ("activate", "cancel") else None
@@ -393,7 +435,8 @@ def run_mode(tape, calibration_index, profile, settings, mode):
                             pending_rebate=float(broker.rebates_pending), fees=float(broker.fees),
                             rebates_credited=float(broker.rebates_credited), funding=float(broker.funding),
                             realized=float(broker.realized), unrealized=float(broker.unrealized(mid)),
-                            status=engine.status, phase=phase))
+                            status=engine.status, phase=phase, retained_quotes=engine.retained_quotes,
+                            request_guard=engine.request_guard.stats()))
 
     for tick in tape[calibration_index + 1:]:
         if tick.snapshot.timestamp - first > settings.duration_seconds:
@@ -434,6 +477,7 @@ def run_mode(tape, calibration_index, profile, settings, mode):
                    maker_fills=sum(f["liquidity"] == "maker" for f in broker.fills),
                    taker_fills=sum(f["liquidity"] == "taker" for f in broker.fills),
                    cancelled=broker.cancelled, rejected=broker.rejected,
+                   retained_quotes=engine.retained_quotes, request_guard=engine.request_guard.stats(),
                    cancel_race_fills=sum(f["during_cancel"] for f in broker.fills),
                    max_position_quote=float(broker.max_abs_position_quote), max_drawdown=float(drawdown),
                    mean_markout_30s=sum(exact_markouts) / len(exact_markouts) if exact_markouts else None,
@@ -463,7 +507,7 @@ def simulate(settings=None):
             for a, b in zip(tape[index + 1:], tape[index + 2:])
             if b.snapshot.timestamp - a.snapshot.timestamp > 10 and
             b.snapshot.timestamp - tape[index + 1].snapshot.timestamp <= settings.duration_seconds]
-    return dict(version=1, settings=settings.model_dump(mode="json"),
+    return dict(version=2, settings=settings.model_dump(mode="json"),
                 calibration=profile.model_dump(mode="json"), results=results,
                 metadata=dict(trading_pair="BTC-USDT", leverage=1,
                               source="Gate BTC top-of-book capture, 2026-09-30" if settings.source == "capture" else "seeded synthetic BTC-like path",
@@ -475,6 +519,7 @@ def simulate(settings=None):
                               latency_model="events take effect on the next observed tick at or after their scheduled time",
                               rebate_model="gross fees debit wallet; pending rebate credits only after configured delay",
                               funding_model="configured rate at observed UTC 8-hour boundaries; no accrued or imputed gap funding",
+                              request_protection="same production guard; attempt counters, reserved cancellation/reduction budget, rolling 24h quote stop, HTTP 429 cooldown",
                               shutdown_model="up to 60 seconds at frozen last book; taker close and slippage included",
                               limitations=["成交、排隊量、滑價與延遲都是假設，沒有真實成交或深度資料。",
                                            "合成行情不代表 Gate 未來價格；真實行情回放的成交仍是假設。",

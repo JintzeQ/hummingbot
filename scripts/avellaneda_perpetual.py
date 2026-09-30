@@ -8,6 +8,7 @@ from pathlib import Path
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.derivative.gate_io_perpetual import gate_io_perpetual_constants as GATE
+from hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_request_guard import GateRequestDeferred
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.utils.avellaneda_perpetual import AvellanedaEngine, AvellanedaSettings, Snapshot
@@ -41,6 +42,18 @@ class AvellanedaPerpetual(ScriptStrategyBase):
         self._halt_position_acknowledged = False
         self._last_metrics_at = float("-inf")
         self._exported_calibration_at = None
+        if not config.dry_run:
+            self.engine.request_guard = self.exchange.enable_request_guard(self.settings)
+            self.engine.request_guard.quote_ttl = self.settings.stale_seconds
+            self.engine.request_guard.quote_validator = self._quote_request_is_current
+
+    def _quote_request_is_current(self, order_id):
+        order = self.engine.orders.get(order_id)
+        if (order is None or order.cancel_at is not None or self.engine.halt_reason is not None
+                or self._stopping or not self._configured):
+            return False
+        snapshot = self._snapshot()
+        return snapshot.valid and snapshot.ready and snapshot.book_age <= self.settings.stale_seconds
 
     @property
     def exchange(self):
@@ -121,6 +134,8 @@ class AvellanedaPerpetual(ScriptStrategyBase):
             return True
         except asyncio.CancelledError:
             raise
+        except GateRequestDeferred:
+            return False  # Preserve last successful acknowledgement; stale data cannot open orders.
         except Exception as exc:
             self.engine.halt(f"authenticated account refresh failed: {exc}")
             return False
@@ -162,6 +177,10 @@ class AvellanedaPerpetual(ScriptStrategyBase):
                     if self._stopping and not q.close:
                         continue
                     if self.engine.halt_reason and not q.market:
+                        continue
+                    guard = self.engine.request_guard
+                    if guard and not guard.allowed("POST", "futures/usdt/orders", trading=True,
+                                                   safety=q.market and q.close):
                         continue
                     place = self.buy if q.side == "buy" else self.sell
                     order_id = place(self.settings.connector, self.settings.trading_pair, q.amount,
@@ -254,7 +273,9 @@ class AvellanedaPerpetual(ScriptStrategyBase):
             self._last_metrics_at = self.current_timestamp
             if self.engine.metrics:
                 row = dict(self.engine.metrics, logged_at=self.current_timestamp,
-                           status=self.engine.status, gamma_reason=self.engine.gamma.reason)
+                           status=self.engine.status, gamma_reason=self.engine.gamma.reason,
+                           retained_quotes=self.engine.retained_quotes,
+                           request_guard=self.engine.request_guard.stats() if self.engine.request_guard else None)
                 self.logger().info("AVELLANEDA_METRICS " + json.dumps(row, sort_keys=True))
         while self.engine.completed_markouts:
             self.logger().info("AVELLANEDA_MARKOUT " + json.dumps(self.engine.completed_markouts.popleft(), sort_keys=True))
@@ -266,7 +287,15 @@ class AvellanedaPerpetual(ScriptStrategyBase):
         self.engine.terminal(event.order_id)
 
     def did_fail_order(self, event):
-        self.engine.terminal(event.order_id, failed=True, timestamp=event.timestamp)
+        guard = self.engine.request_guard
+        deferred = guard is not None and event.order_id in guard.deferred_orders
+        if deferred:
+            guard.deferred_orders.discard(event.order_id)
+            order = self.engine.orders.get(event.order_id)
+            if order and order.quote.market:
+                self.engine.close_attempts = max(0, self.engine.close_attempts - 1)
+            # Failed before acceptance or explicit 429: no normal failure escalation.
+        self.engine.terminal(event.order_id, failed=not deferred, timestamp=event.timestamp)
 
     def did_complete_buy_order(self, event):
         self.engine.terminal(event.order_id)
@@ -309,6 +338,9 @@ class AvellanedaPerpetual(ScriptStrategyBase):
         rows.extend([f"Gamma {c.gamma_mode}: base={e.gamma.base:.8g}, current={e.gamma.current:.8g}, "
                      f"target={e.gamma.target:.8g}, bounds={e.gamma.bounds} | {e.gamma.reason}",
                      f"Calibration: {e.calibration_reason}"])
+        rows.append(f"Unchanged quotes retained: {e.retained_quotes} | max age: {c.max_order_age_seconds}s")
+        if e.request_guard:
+            rows.append("Request protection: " + json.dumps(e.request_guard.stats(), sort_keys=True))
         if e.metrics:
             m = e.metrics
             rows.append(f"Observed at {m['timestamp']}: inventory q={m['inventory_ratio']:.4f} | "
