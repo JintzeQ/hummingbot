@@ -1,0 +1,32 @@
+# Fractions, not percentage points. Preview mode never submits/cancels orders
+# or changes leverage/position mode. Copy to conf/scripts before starting.
+script_file_name: avellaneda_perpetual.py
+connector: gate_io_perpetual
+trading_pair: BTC-USDT
+dry_run: true
+leverage: 1
+capital_budget_quote: "30"
+order_amount_quote: "10"
+max_position_quote: "20"
+available_balance_reserve: "5"
+risk_factor: 1.0
+kappa: 10000.0
+horizon_seconds: 30.0
+# Full bid/ask spread floor = 0.04%, not 0.04% on each side.
+min_spread: "0.0004"
+adverse_selection_buffer: "0.0001"
+max_spread: "0.02"
+maker_fee: "0.0002"
+taker_fee: "0.0005"
+rebate_rate: "0.6"
+volatility_samples: 200
+warmup_samples: 20
+refresh_seconds: 5.0
+stale_seconds: 10.0
+reconciliation_timeout: 15.0
+cancel_timeout: 10.0
+max_session_loss_quote: "1"
+max_order_failures: 3
+max_close_attempts: 3
+flatten_on_stop: true
+stop_timeout: 30.0
