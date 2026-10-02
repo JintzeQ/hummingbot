@@ -1,4 +1,5 @@
 import asyncio
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,7 +22,7 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
@@ -43,6 +44,36 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
     TICK_INTERVAL_LIMIT = 120.0
 
     web_utils = web_utils
+
+    def reserve_portfolio_order_id(self, client_id: str):
+        """Use one pre-journaled ID through the normal strategy buy/sell path."""
+        if not re.fullmatch(r"t-ga[0-9a-f]{24}", client_id):
+            raise ValueError("Invalid portfolio client order ID")
+        if getattr(self, "_gate_portfolio_client_order_id", None) is not None:
+            raise ValueError("Portfolio order ID already reserved")
+        self._gate_portfolio_client_order_id = client_id
+
+    def buy(self, trading_pair: str, amount: Decimal, order_type=OrderType.LIMIT, price=s_decimal_NaN, **kwargs) -> str:
+        return self._order_with_reserved_id(TradeType.BUY, trading_pair, amount, order_type, price, **kwargs)
+
+    def sell(self, trading_pair: str, amount: Decimal, order_type=OrderType.LIMIT, price=s_decimal_NaN, **kwargs) -> str:
+        return self._order_with_reserved_id(TradeType.SELL, trading_pair, amount, order_type, price, **kwargs)
+
+    def _order_with_reserved_id(self, trade_type, trading_pair, amount, order_type, price, **kwargs):
+        client_id = getattr(self, "_gate_portfolio_client_order_id", None)
+        if client_id is None:
+            method = super().buy if trade_type == TradeType.BUY else super().sell
+            return method(trading_pair, amount, order_type, price, **kwargs)
+        del self._gate_portfolio_client_order_id
+        task = asyncio.ensure_future(self._create_order(
+            trade_type=trade_type, order_id=client_id, trading_pair=trading_pair,
+            amount=amount, order_type=order_type, price=price, **kwargs))
+        tasks = getattr(self, "_gate_portfolio_order_tasks", None)
+        if tasks is None:
+            self._gate_portfolio_order_tasks = tasks = {}
+        tasks[client_id] = task
+        task.add_done_callback(lambda completed: tasks.pop(client_id, None))
+        return client_id
 
     def __init__(self,
                  gate_io_perpetual_api_key: str,
@@ -272,7 +303,7 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
 
                 min_amount_inc = Decimal(f"{rule['quanto_multiplier']}")
                 min_price_inc = Decimal(f"{rule['order_price_round']}")
-                min_amount = min_amount_inc
+                min_amount = min_amount_inc * Decimal(str(rule.get("order_size_min", 1)))
                 min_notional = Decimal(str(1))
                 result[trading_pair] = TradingRule(trading_pair,
                                                    min_order_size=min_amount,
@@ -285,6 +316,13 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().error(f"Error parsing the trading pair rule {rule}. Skipping.", exc_info=True)
         return list(result.values())
 
+    def _allow_small_reduce_only_order(self, order, **kwargs) -> bool:
+        # Gate expresses its minimum in contract lots. The connector's generic
+        # 1-USDT entry floor must not strand a valid integer-lot reducing tail.
+        # _create_order still validates the contract minimum/step, and
+        # _place_order always transmits reduce_only for this exact action.
+        return kwargs.get("position_action") == PositionAction.CLOSE
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -295,11 +333,17 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                            **kwargs) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         size = self._format_amount_to_size(trading_pair, amount)
+        if not size.is_finite() or size <= 0 or size != size.to_integral_value():
+            raise ValueError("Gate order size must be a positive integer number of contracts")
         data = {
             "text": order_id,
             "contract": symbol,
-            "size": float(-size) if trade_type.name.lower() == 'sell' else float(size),
+            "size": int(-size) if trade_type.name.lower() == 'sell' else int(size),
         }
+        # CLOSE must not open a reverse position if another close fills first.
+        # The perpetual base forwards PositionAction through kwargs.
+        if kwargs.get("position_action") == PositionAction.CLOSE:
+            data["reduce_only"] = True
         if order_type.is_limit_type():
             data.update({
                 "price": f"{price:f}",
@@ -323,8 +367,9 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             is_auth_required=True,
             limit_id=endpoint,
         )
-        if order_result.get('finish_as') in {"cancelled", "expired", "failed", "ioc"}:
-            raise IOError({"label": "ORDER_REJECTED", "message": "Order rejected."})
+        # A successful response with an exchange ID may already be partially
+        # filled and IOC-canceled. Retain its identity for fill/status polling;
+        # an IOC terminal reason is not an API rejection or a zero-fill proof.
         exchange_order_id = str(order_result["id"])
         return exchange_order_id, self.current_timestamp
 

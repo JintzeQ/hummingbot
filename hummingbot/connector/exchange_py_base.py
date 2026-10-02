@@ -388,6 +388,9 @@ class ExchangePyBase(ExchangeBase, ABC):
         failed_cancellations = [CancellationResult(oid, False) for oid in order_id_set]
         return successful_cancellations + failed_cancellations
 
+    def _allow_small_reduce_only_order(self, order, **kwargs) -> bool:
+        return False
+
     async def _create_order(self,
                             trade_type: TradeType,
                             order_id: str,
@@ -443,7 +446,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                                      f"for the pair {trading_pair}. The order will not be created."))
             return
 
-        elif notional_size < trading_rule.min_notional_size:
+        elif (notional_size < trading_rule.min_notional_size
+              and not self._allow_small_reduce_only_order(order, **kwargs)):
             self._update_order_after_failure(
                 order_id=order_id, trading_pair=trading_pair,
                 exception=ValueError(f"Order notional {notional_size} is lower than minimum notional size {trading_rule.min_notional_size}"

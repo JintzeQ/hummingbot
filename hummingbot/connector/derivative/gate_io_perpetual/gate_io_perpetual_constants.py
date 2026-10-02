@@ -13,6 +13,7 @@ WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 # Public API v4 Endpoints
 EXCHANGE_INFO_URL = "futures/usdt/contracts"
 TICKER_PATH_URL = "futures/usdt/tickers"
+CANDLESTICKS_PATH_URL = "futures/usdt/candlesticks"
 ORDER_BOOK_PATH_URL = "futures/usdt/order_book"
 MY_TRADES_PATH_URL = "futures/usdt/my_trades"
 MARK_PRICE_URL = "futures/usdt/contracts/{id}"
@@ -21,6 +22,7 @@ FUNDING_RATE_TIME_PATH_URL = "futures/usdt/funding_rate"
 
 ORDER_CREATE_PATH_URL = "futures/usdt/orders"
 ORDER_DELETE_PATH_URL = "futures/usdt/orders/{id}"
+COUNTDOWN_CANCEL_PATH_URL = "futures/usdt/countdown_cancel_all"
 USER_BALANCES_PATH_URL = "futures/usdt/accounts"
 POSITION_INFORMATION_URL = "futures/usdt/positions"
 ORDER_STATUS_PATH_URL = "futures/usdt/orders/{id}"
@@ -67,6 +69,8 @@ RATE_LIMITS = [
     RateLimit(limit_id=PUBLIC_URL_POINTS_LIMIT_ID, limit=300, time_interval=1),
     RateLimit(limit_id=PRIVATE_URL_POINTS_LIMIT_ID, limit=400, time_interval=1),
     RateLimit(limit_id=CANCEL_ORDERS_LIMITS_ID, limit=400, time_interval=1),
+    RateLimit(limit_id=CANDLESTICKS_PATH_URL, limit=100, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(PUBLIC_URL_POINTS_LIMIT_ID)]),
     RateLimit(limit_id=NETWORK_CHECK_PATH_URL, limit=300, time_interval=1,
               linked_limits=[LinkedLimitWeightPair(PUBLIC_URL_POINTS_LIMIT_ID)]),
     RateLimit(limit_id=EXCHANGE_INFO_URL, limit=300, time_interval=1,
@@ -75,6 +79,8 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(PRIVATE_URL_POINTS_LIMIT_ID)]),
     RateLimit(limit_id=ORDER_DELETE_LIMIT_ID, limit=400, time_interval=1,
               linked_limits=[LinkedLimitWeightPair(CANCEL_ORDERS_LIMITS_ID)]),
+    RateLimit(limit_id=COUNTDOWN_CANCEL_PATH_URL, limit=100, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(PRIVATE_URL_POINTS_LIMIT_ID)]),
     RateLimit(limit_id=USER_BALANCES_PATH_URL, limit=400, time_interval=1,
               linked_limits=[LinkedLimitWeightPair(PRIVATE_URL_POINTS_LIMIT_ID)]),
     RateLimit(limit_id=SET_POSITION_MODE_URL, limit=400, time_interval=1,
