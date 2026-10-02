@@ -11,6 +11,28 @@ quote_refresh_seconds: 15
 exit_timeout_seconds: 60
 allow_market_exit: true
 maker_fee_floor: '0.0002'
+micro:
+  enabled: true
+  mode: protect # observe logs without changing reference, sizes or retirement
+  micro_weight: '0.25' # weighted-mid proxy, not a fitted Stoikov model
+  max_age: 2
+  warmup_seconds: 5
+  min_samples: 20
+  window_seconds: 5
+  baseline_seconds: 120
+  ema_seconds: 1
+  confirm_seconds: 2
+  recover_seconds: 5
+  retire_seconds: 60
+  match_grace_seconds: 0.5
+  imbalance_threshold: '0.6'
+  flow_threshold: '0.5'
+  min_flow_quote: '25'
+  depth_floor_ratio: '0.35'
+  unmatched_loss_ratio: '0.5'
+  caution_scale: '0.5'
+  reprice_bps: '2'
+  min_reprice_seconds: 2
 risk:
   capital: '100'
   reserve: '20'
@@ -32,3 +54,4 @@ risk:
   max_age: 15
   failures_to_retire: 3
   cooldown: 600
+

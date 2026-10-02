@@ -169,6 +169,30 @@ class PortfolioTests(unittest.TestCase):
 
 
 class QuoteTests(unittest.TestCase):
+    def test_micro_reference_shifts_quotes_with_passive_guards(self):
+        m = market(volatility=D("0.02"), tick=D("0.0001"))
+        base = avellaneda_quotes(m, D("0"), Settings())
+        shifted = avellaneda_quotes(m, D("0"), Settings(), reference_price=D("10.005"))
+        self.assertGreater(shifted[0].price, base[0].price)
+        self.assertLessEqual(shifted[0].price, m.bid)
+        self.assertGreaterEqual(shifted[1].price, m.ask)
+
+    def test_micro_scales_only_increasing_side(self):
+        for position in (D("1"), D("-1")):
+            original = avellaneda_quotes(market(), position, Settings())
+            scaled = avellaneda_quotes(market(), position, Settings(), buy_scale=D("0.5"), sell_scale=D("0.5"))
+            for a, b in zip(original, scaled):
+                if a.close:
+                    self.assertEqual(a.amount, b.amount)
+                else:
+                    self.assertLess(b.amount, a.amount)
+
+    def test_micro_rejects_invalid_reference_and_size_scale(self):
+        for kwargs in [dict(reference_price=D("11")), dict(reference_price=D("NaN")),
+                       dict(buy_scale=D("-0.1")), dict(sell_scale=D("2")), dict(buy_scale=D("Infinity"))]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                avellaneda_quotes(market(), D("0"), Settings(), **kwargs)
+
     def test_passive_prices_and_step_sizes(self):
         m = market()
         quotes = avellaneda_quotes(m, D("0"), Settings())

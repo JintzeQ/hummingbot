@@ -114,7 +114,7 @@ def load_adapter():
         "hummingbot.core.network_iterator": module("network", NetworkStatus=NetworkStatus),
         "hummingbot.strategy.__utils__.trailing_indicators.instant_volatility": module("vol", InstantVolatilityIndicator=Indicator),
         "hummingbot.strategy.__utils__.trailing_indicators.trading_intensity": module("intensity", TradingIntensityIndicator=Intensity),
-        "hummingbot.strategy.order_book_asset_price_delegate": module("delegate", OrderBookAssetPriceDelegate=lambda info: info),
+        "hummingbot.strategy.order_book_asset_price_delegate": module("delegate", OrderBookAssetPriceDelegate=lambda market, pair: object()),
         "hummingbot.strategy.market_trading_pair_tuple": module("tuple", MarketTradingPairTuple=lambda *args: args),
         "hummingbot.strategy.script_strategy_base": module("script", ScriptStrategyBase=ScriptBase),
     }
@@ -141,7 +141,7 @@ class FakeConnector:
         self.account_book = []
         self.open_orders = []
         self.account = dict(available="100", total="100", unrealised_pnl="0")
-        self.book = dict(bids=[dict(p="9.99", s="100000")], asks=[dict(p="10.01", s="100000")])
+        self.book = dict(id=100, bids=[dict(p="9.99", s="100000")], asks=[dict(p="10.01", s="100000")])
         self.sent, self.cancels, self.requests = [], [], []
         self.error = None
         self.setup_success = True

@@ -57,6 +57,9 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot_response: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp: float = self._time()
+        feed = getattr(self._connector, "_gate_market_signal_feed", None)
+        if feed is not None:
+            feed.seed_snapshot(trading_pair, snapshot_response, snapshot_timestamp)
         snapshot_msg: OrderBookMessage = OrderBookMessage(
             OrderBookMessageType.SNAPSHOT,
             {
@@ -80,7 +83,8 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         """
         params = {
             "contract": await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "with_id": json.dumps(True)
+            "with_id": json.dumps(True),
+            "limit": 100,
         }
 
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -107,6 +111,11 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 "price": trade_data["price"],
                 "amount": abs(self._connector._format_size_to_amount(trading_pair, size))
             }
+            feed = getattr(self._connector, "_gate_market_signal_feed", None)
+            if feed is not None:
+                feed.observe_trade(trading_pair, trade_data["id"], trade_timestamp,
+                                   trade_data["price"], message_content["amount"], size > 0,
+                                   self._time(), trade_data.get("is_internal", False))
             trade_message: Optional[OrderBookMessage] = OrderBookMessage(
                 message_type=OrderBookMessageType.TRADE,
                 content=message_content,
@@ -120,6 +129,9 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         update_id: int = diff_data["u"]
 
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=diff_data["s"])
+        feed = getattr(self._connector, "_gate_market_signal_feed", None)
+        if feed is not None:
+            feed.observe_depth(trading_pair, diff_data, self._time())
 
         order_book_message_content = {
             "trading_pair": trading_pair,
@@ -131,7 +143,7 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                      diff_data["a"]],
         }
         diff_message: OrderBookMessage = OrderBookMessage(
-            OrderBookMessageType.DIFF,
+            OrderBookMessageType.SNAPSHOT if diff_data.get("full", False) else OrderBookMessageType.DIFF,
             order_book_message_content,
             timestamp)
 
@@ -159,7 +171,7 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                     "time": int(self._time()),
                     "channel": CONSTANTS.ORDERS_UPDATE_ENDPOINT_NAME,
                     "event": "subscribe",
-                    "payload": [symbol, "100ms"]
+                    "payload": [symbol, "100ms", "100"]
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
 
@@ -187,6 +199,9 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         return channel
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
+        feed = getattr(self._connector, "_gate_market_signal_feed", None)
+        if feed is not None:
+            feed.reset()
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         await ws.connect(ws_url=CONSTANTS.WS_URL, ping_timeout=CONSTANTS.PING_TIMEOUT)
         return ws

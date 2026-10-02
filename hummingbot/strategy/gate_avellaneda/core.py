@@ -211,15 +211,21 @@ def floor_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def avellaneda_quotes(market: Market, position: Decimal, settings: Settings) -> List[Intent]:
+def avellaneda_quotes(market: Market, position: Decimal, settings: Settings,
+                      reference_price=None, buy_scale: Decimal = D("1"), sell_scale: Decimal = D("1")) -> List[Intent]:
     """Hummingbot variant: absolute volatility (not variance), infinite horizon.
 
     Inventory is signed contract exposure / configured position cap. A reducing
     side never crosses zero: any future opposite opening requires a new snapshot.
     """
     mid = market.mid
+    reference = mid if reference_price is None else reference_price
+    if not reference.is_finite() or not market.bid <= reference <= market.ask:
+        raise ValueError("Reference price must be within the book")
+    if any(not v.is_finite() or not ZERO <= v <= D("1") for v in (buy_scale, sell_scale)):
+        raise ValueError("Opening size scales must be finite and between zero and one")
     q = max(D("-1"), min(D("1"), position * mid / settings.max_position_quote))
-    reservation = mid - q * settings.gamma * market.volatility
+    reservation = reference - q * settings.gamma * market.volatility
     spread = settings.gamma * market.volatility
     spread += 2 * (1 + settings.gamma / market.kappa).ln() / settings.gamma
     fee = max(ZERO, market.maker_fee)
@@ -241,6 +247,7 @@ def avellaneda_quotes(market: Market, position: Decimal, settings: Settings) -> 
             amount = min(amount, max(ZERO, settings.max_position_quote - increasing) / max(mid, price))
             if (buy and q > 0) or (not buy and q < 0):
                 amount *= (-settings.eta * abs(q)).exp()
+            amount *= buy_scale if buy else sell_scale
         amount = floor_step(amount, market.step)
         if amount >= market.minimum:
             result.append(Intent(market.pair, buy, amount, price, close))
@@ -303,3 +310,4 @@ def candidate_universe(contracts: List[dict], tickers: List[dict], settings: Set
             continue
     candidates.sort(key=lambda item: (-item[0], item[1]))
     return {pair: contract for _, pair, contract in candidates[:limit]}
+

@@ -28,7 +28,7 @@ from hummingbot.strategy.gate_avellaneda.core import (
     Intent, Market, Portfolio, Settings, ZERO, allocate, avellaneda_quotes, candidate_universe,
 )
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
-from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
+from hummingbot.strategy.gate_avellaneda.microstructure import GateMarketSignalFeed, MicroSettings
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
@@ -36,6 +36,7 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     dry_run: bool = True
     risk: Settings = Field(default_factory=Settings)
+    micro: MicroSettings = Field(default_factory=MicroSettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -92,6 +93,18 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.contracts = dict(self._initial_contracts)
         self.tickers = dict(self._initial_tickers)
         self.books = {}
+        self.signal_feed = GateMarketSignalFeed(
+            {p: Decimal(str(c["quanto_multiplier"])) for p, c in self.contracts.items()}, config.micro,
+        )
+        if config.micro.enabled:
+            if getattr(self.connector, "_gate_market_signal_feed", None) is not None:
+                raise ValueError("Market signal feed already owned by another strategy")
+            self.connector._gate_market_signal_feed = self.signal_feed
+        self.signals = {}
+        self.quote_references = {}
+        self.last_submission = {}
+        self.last_micro_limits = {}
+        self.next_signal_log = 0
         self.indicators = {}
         self.history = {p: deque(maxlen=config.sample_ticks) for p in self.contracts}
         self.orders: Dict[str, TrackedOrder] = {}
@@ -159,6 +172,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 self._cancel_pair(pair)
                 # An already-flat loss exit can be replaced on this tick.
                 self.next_monitor = 0
+        self._micro_telemetry(now)
         if now >= self.next_monitor:
             before = {(p, s.state) for p, s in self.portfolio.slots.items()}
             self.portfolio.evaluate(snapshots, now, fresh, self.positions,
@@ -174,6 +188,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         intents = []
         for pair, slot in list(self.portfolio.slots.items()):
             market = snapshots.get(pair)
+            signal = self.signals.get(pair)
+            protecting = self.config.micro.enabled and self.config.micro.mode == "protect"
+            if protecting and signal and signal.ready and signal.retire and slot.state == "active":
+                self.portfolio.retire(pair, "persistent microstructure anomaly: " + signal.reason, now)
             if slot.state == "retiring":
                 # Do not submit a close against an account snapshot which still
                 # includes an opening order that is being cancelled.
@@ -196,6 +214,18 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if market is None or market.rejection(self.config.risk, now):
                 self._cancel_pair(pair)
                 continue
+            if protecting and signal and signal.ready:
+                previous = self.last_micro_limits.get(pair, (Decimal(1), Decimal(1), False))
+                stricter = (signal.buy_scale < previous[0] or signal.sell_scale < previous[1]
+                            or (signal.paused and not previous[2]))
+                if stricter:
+                    self._cancel_pair(pair)
+                    self.next_quote[pair] = 0
+                previous_reference = self.quote_references.get(pair)
+                threshold = max(2 * market.tick, market.mid * self.config.micro.reprice_bps / Decimal(10000))
+                if (previous_reference is not None and abs(signal.reference - previous_reference) >= threshold
+                        and now - self.last_submission.get(pair, 0) >= self.config.micro.min_reprice_seconds):
+                    self.next_quote[pair] = 0
             if now < self.next_quote.get(pair, 0):
                 continue
             if any(o.intent.pair == pair for o in self.orders.values()):
@@ -204,7 +234,15 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if pair in self.exchange_open_pairs:
                 self._cancel_pair(pair)
                 continue
-            intents.extend(avellaneda_quotes(market, self.positions.get(pair, ZERO), self.config.risk))
+            quotes = avellaneda_quotes(
+                market, self.positions.get(pair, ZERO), self.config.risk,
+                reference_price=signal.reference if protecting else None,
+                buy_scale=signal.buy_scale if protecting else Decimal(1),
+                sell_scale=signal.sell_scale if protecting else Decimal(1),
+            )
+            if protecting and signal.paused:
+                quotes = [q for q in quotes if q.close]
+            intents.extend(quotes)
         if not intents:
             return
         outstanding = {}
@@ -221,6 +259,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 if quotes:
                     self.logger().info(f"DRY RUN {pair}: {quotes}")
                     self.next_quote[pair] = now + self.config.quote_refresh_seconds
+                    self._remember_quote_signal(pair)
             return
         # One submission batch per reconciled account revision. This prevents
         # the second pair/tick reusing collateral before the exchange updates it.
@@ -235,9 +274,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             try:
                 book = self.connector.get_order_book(pair)
                 if pair not in self.indicators:
-                    base, quote = pair.rsplit("-", 1)
-                    info = MarketTradingPairTuple(self.connector, pair, base, quote)
-                    delegate = OrderBookAssetPriceDelegate(info)
+                    delegate = OrderBookAssetPriceDelegate(self.connector, pair)
                     self.indicators[pair] = (
                         InstantVolatilityIndicator(sampling_length=self.config.sample_ticks),
                         TradingIntensityIndicator(book, delegate, sampling_length=self.config.sample_ticks),
@@ -254,18 +291,30 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
 
     def _snapshots(self):
         snapshots = {}
-        for pair, (raw, observed_at) in self.books.items():
+        for pair in self.contracts:
             try:
                 contract = self.contracts[pair]
                 multiplier = Decimal(str(contract["quanto_multiplier"]))
-                bids, asks = raw["bids"], raw["asks"]
-                bid, ask = Decimal(str(bids[0]["p"])), Decimal(str(asks[0]["p"]))
+                if self.config.micro.enabled:
+                    signal = self.signal_feed.signal(pair, self.current_timestamp)
+                    self.signals[pair] = signal
+                    if not signal.ready:
+                        continue
+                    bid, ask = signal.bid, signal.ask
+                    bid_depth, ask_depth = signal.bid_depth, signal.ask_depth
+                    observed_at = signal.observed_at
+                else:
+                    raw, observed_at = self.books[pair]
+                    bids, asks = raw["bids"], raw["asks"]
+                    bid, ask = Decimal(str(bids[0]["p"])), Decimal(str(asks[0]["p"]))
                 mid = (bid + ask) / 2
                 if not mid.is_finite() or mid <= 0:
                     continue
-                def depth(rows):
-                    return sum((Decimal(str(r["p"])) * abs(Decimal(str(r["s"]))) * multiplier
-                                for r in rows if abs(Decimal(str(r["p"])) / mid - 1) <= Decimal("0.001")), ZERO)
+                if not self.config.micro.enabled:
+                    def depth(rows):
+                        return sum((Decimal(str(r["p"])) * abs(Decimal(str(r["s"]))) * multiplier
+                                    for r in rows if abs(Decimal(str(r["p"])) / mid - 1) <= Decimal("0.001")), ZERO)
+                    bid_depth, ask_depth = depth(bids), depth(asks)
                 vol, intensity = self.indicators[pair]
                 alpha, kappa = intensity.current_value
                 history = self.history[pair]
@@ -276,7 +325,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 ticker = self.tickers[pair]
                 snapshots[pair] = Market(
                     pair, bid, ask, Decimal(str(vol.current_value)), Decimal(str(kappa)), Decimal(str(alpha)),
-                    Decimal(str(ticker["volume_24h_quote"])), depth(bids), depth(asks),
+                    Decimal(str(ticker["volume_24h_quote"])), bid_depth, ask_depth,
                     Decimal(str(ticker["funding_rate_indicative"])), trend, max(self.config.maker_fee_floor, fee),
                     multiplier, Decimal(str(contract["order_price_round"])),
                     multiplier * Decimal(str(contract["order_size_min"])), observed_at,
@@ -286,6 +335,27 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             except (KeyError, IndexError, ValueError, ArithmeticError):
                 continue
         return snapshots
+
+    def _remember_quote_signal(self, pair):
+        signal = self.signals.get(pair)
+        if self.config.micro.enabled and signal and signal.ready:
+            self.quote_references[pair] = signal.reference
+            self.last_submission[pair] = self.current_timestamp
+            self.last_micro_limits[pair] = (signal.buy_scale, signal.sell_scale, signal.paused)
+
+    def _micro_telemetry(self, now):
+        if not self.config.micro.enabled or now < self.next_signal_log:
+            return
+        for pair in self.portfolio.slots:
+            s = self.signals.get(pair)
+            if s:
+                self.logger().info("MICRO " + json.dumps(dict(
+                    pair=pair, mode=self.config.micro.mode, ready=s.ready, reason=s.reason,
+                    weighted_mid=str(s.weighted_mid), reference=str(s.reference), imbalance=str(s.imbalance),
+                    flow=str(s.flow), flow_quote=str(s.flow_quote), bid_loss=str(s.bid_loss), ask_loss=str(s.ask_loss),
+                    paused=s.paused, buy_scale=str(s.buy_scale), sell_scale=str(s.sell_scale),
+                )))
+        self.next_signal_log = now + 10
 
     async def _refresh(self):
         try:
@@ -363,16 +433,21 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self.contracts[pair] = contract_map.get(pair, dict(self.contracts[pair], in_delisting=True))
                 self.tickers = {t["contract"].replace("_", "-"): t for t in tickers}
                 self.next_public = self.current_timestamp + self.config.monitor_seconds
-            if self.current_timestamp >= self.next_books:
+            resync_needed = self.config.micro.enabled and any(self.signal_feed.needs_snapshot(p) for p in self.contracts)
+            if resync_needed or self.current_timestamp >= self.next_books:
                 semaphore = asyncio.Semaphore(4)
 
                 async def fetch_book(pair):
+                    if self.config.micro.enabled and not self.signal_feed.needs_snapshot(pair):
+                        return
                     async with semaphore:
                         try:
                             raw = await self.connector._api_get(
-                                path_url=C.ORDER_BOOK_PATH_URL, params={"contract": pair.replace("-", "_"), "limit": 20},
+                                path_url=C.ORDER_BOOK_PATH_URL, params={"contract": pair.replace("-", "_"), "limit": 100, "with_id": "true"},
                             )
                             self.books[pair] = (raw, self.current_timestamp)
+                            if self.config.micro.enabled:
+                                self.signal_feed.seed_snapshot(pair, raw, self.current_timestamp)
                         except Exception as exc:
                             self.logger().warning(f"Book refresh failed for {pair}: {exc}")
 
@@ -497,6 +572,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                           price=intent.price, position_action=PositionAction.CLOSE if intent.close else PositionAction.OPEN)
         self.orders[order_id] = TrackedOrder(intent, intent.amount, self.current_timestamp)
         self.next_quote[intent.pair] = self.current_timestamp + self.config.quote_refresh_seconds
+        self._remember_quote_signal(intent.pair)
 
     def _cancel_pair(self, pair):
         if self.config.dry_run:
@@ -550,6 +626,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.refresh_task.cancel()
             await asyncio.gather(self.refresh_task, return_exceptions=True)
         self._cancel_all()
+        if getattr(self.connector, "_gate_market_signal_feed", None) is self.signal_feed:
+            delattr(self.connector, "_gate_market_signal_feed")
         # Hummingbot stopping removes the strategy clock. Do not claim that a
         # cancellation request or a sent close order is a confirmed flat account.
         if self.positions or self.orders or self.exchange_open_pairs or any(self.expected_positions.values()):
@@ -571,8 +649,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         for pair, slot in self.portfolio.slots.items():
             lines.append(f"{pair}: {slot.state}, position={self.positions.get(pair, ZERO)}, "
                          f"net_PnL={self._pair_pnl(pair)} USDT, reason={slot.reason or '-'}")
+            signal = self.signals.get(pair)
+            if self.config.micro.enabled and signal:
+                lines.append(f"  micro={self.config.micro.mode}, ready={signal.ready}, reference={signal.reference}, "
+                             f"flow={signal.flow}, unmatched_bid={signal.bid_loss}, unmatched_ask={signal.ask_loss}, "
+                             f"paused={signal.paused}, reason={signal.reason}")
             for quote in self.last_quotes.get(pair, []):
                 lines.append(f"  {'buy' if quote.buy else 'sell'} {quote.amount} @ {quote.price}, close={quote.close}")
         if self.portfolio.excluded:
             lines.append("Loss-stopped pairs excluded this run: " + ", ".join(sorted(self.portfolio.excluded)))
         return "\n".join(lines)
+
