@@ -137,8 +137,6 @@ class AdaptiveQuoteTests(unittest.TestCase):
         b = self.plan(m)
         self.assertEqual([q.price * 100 for q in a.intents], [q.price for q in b.intents])
         self.assertEqual(a.position_cap, b.position_cap)
-        gamma = quote_plan(market(), D("0"), 0, replace(self.risk, gamma=D("20")), self.settings, 100)
-        self.assertEqual(a.intents, gamma.intents)
 
     def test_scheduled_funding_cost_widens_only_paying_opening(self):
         for funding in (D("0.001"), D("-0.001")):

@@ -31,6 +31,7 @@ from hummingbot.strategy.gate_avellaneda.adaptive import (
     AdaptiveSettings, InventoryTracker, LossCircuit, ReturnHistory, entry_rejection,
     exposure_bounds, exposure_scale, limit_exposure, quote_plan,
 )
+from hummingbot.strategy.gate_avellaneda.gamma import GammaController, GammaSettings
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
 from hummingbot.strategy.gate_avellaneda.microstructure import GateMarketSignalFeed, MicroSettings
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -42,6 +43,7 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     risk: Settings = Field(default_factory=Settings)
     micro: MicroSettings = Field(default_factory=MicroSettings)
     adaptive: AdaptiveSettings = Field(default_factory=AdaptiveSettings)
+    gamma_control: GammaSettings = Field(default_factory=GammaSettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -57,6 +59,9 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     def validate_refresh_age(self):
         if self.risk.max_age <= self.book_refresh_seconds + self.account_refresh_seconds:
             raise ValueError("max_age must exceed the book refresh interval plus the account refresh interval")
+        if (self.adaptive.enabled and self.gamma_control.enabled
+                and not self.gamma_control.minimum <= self.risk.gamma <= self.gamma_control.maximum):
+            raise ValueError("Base risk.gamma must fit gamma_control bounds")
         return self
 
 
@@ -97,6 +102,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.inventory = InventoryTracker(config.adaptive)
         self.loss_circuit = LossCircuit(config.adaptive)
         self.return_history = ReturnHistory(config.adaptive)
+        self.gamma = GammaController(config.risk, config.adaptive,
+                                     config.gamma_control if config.adaptive.enabled else GammaSettings(enabled=False))
+        self.last_gamma_values = {}
         self.plans = {}
         self.last_control_limits = {}
         self.entry_allowed = True
@@ -189,6 +197,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 # An already-flat loss exit can be replaced on this tick.
                 self.next_monitor = 0
         if self.config.adaptive.enabled:
+            for pair, market in snapshots.items():
+                signal = self.signals.get(pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None
+                self.gamma.update(market, self._pair_pnl(pair) if pair in self.portfolio.slots else ZERO, now, signal)
             healthy = any(self._entry_check(m) is None for m in snapshots.values())
             allowed = self.loss_circuit.allow_open(now, healthy, self.config.micro.max_age if self.config.micro.enabled
                                                    else self.config.risk.max_age)
@@ -267,6 +278,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self.config.risk, self.config.adaptive, now, signal if protecting else None,
                     allow_open=self.entry_allowed and not joint_breach,
                     blocked_side=self.inventory.blocked_side(pair, now),
+                    gamma=self.gamma.value(pair),
                 )
                 self.plans[pair] = plan
                 opening = any(not q.close for q in plan.intents)
@@ -284,6 +296,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     if opening:
                         self._cancel_pair(pair)
                         self.next_quote[pair] = 0
+                if self._gamma_reprice_needed(pair, plan, market, now):
+                    self.next_quote[pair] = 0
             elif market.rejection(self.config.risk, now):
                 self._cancel_pair(pair)
                 continue
@@ -432,7 +446,19 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         signal = self.signals.get(market.pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None
         if signal is not None and signal.paused:
             return "microstructure opening paused"
-        return entry_rejection(market, self.config.risk, self.config.adaptive, self.current_timestamp, signal)
+        return entry_rejection(market, self.config.risk, self.config.adaptive, self.current_timestamp, signal,
+                               gamma=self.gamma.value(market.pair))
+
+    def _gamma_reprice_needed(self, pair, plan, market, now):
+        if (plan.gamma == self.last_gamma_values.get(pair, plan.gamma)
+                or now - self.last_submission.get(pair, now) < self.config.gamma_control.min_reprice_seconds):
+            return False
+        threshold = max(2 * market.tick, market.mid * self.config.gamma_control.reprice_bps / Decimal(10000))
+        targets = {(intent.buy, intent.close): intent.price for intent in plan.intents}
+        working = self.last_quotes.get(pair, ()) if self.config.dry_run else (
+            o.intent for o in self.orders.values() if o.intent.pair == pair)
+        return any(not intent.market and (intent.buy, intent.close) in targets
+                   and abs(targets[intent.buy, intent.close] - intent.price) >= threshold for intent in working)
 
     def _candidate_filter(self, pair, selected):
         eligible = self.return_history.eligible(pair, selected, self.current_timestamp)
@@ -475,13 +501,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             order.cancel_at = self.current_timestamp
 
     def _remember_quote_signal(self, pair):
+        self.last_submission[pair] = self.current_timestamp
         signal = self.signals.get(pair)
         if self.config.micro.enabled and signal and signal.ready:
             self.quote_references[pair] = self.plans[pair].reference if self.config.adaptive.enabled and pair in self.plans else signal.reference
-            self.last_submission[pair] = self.current_timestamp
             self.last_micro_limits[pair] = (signal.buy_scale, signal.sell_scale, signal.paused)
         if self.config.adaptive.enabled and pair in self.plans:
             self.last_control_limits[pair] = self._control_limits(pair, self.plans[pair])
+            self.last_gamma_values[pair] = self.plans[pair].gamma
 
     def _micro_telemetry(self, now):
         if not self.config.micro.enabled or now < self.next_signal_log:
@@ -803,6 +830,12 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         for pair, slot in self.portfolio.slots.items():
             lines.append(f"{pair}: {slot.state}, position={self.positions.get(pair, ZERO)}, "
                          f"net_PnL={self._pair_pnl(pair)} USDT, reason={slot.reason or '-'}")
+            if self.config.adaptive.enabled:
+                state = self.gamma.states.get(pair)
+                lines.append(f"  gamma_mode={'adaptive' if self.config.gamma_control.enabled else 'fixed'}, "
+                             f"gamma={self.gamma.value(pair)}, gamma_target={state.target if state else self.config.risk.gamma}, "
+                             f"quoted_gamma={self.last_gamma_values.get(pair, '-')}, "
+                             f"gamma_stress={state.components if state else {}}")
             plan = self.plans.get(pair)
             if self.config.adaptive.enabled and plan:
                 lines.append(f"  inventory_stage={plan.stage}, age={self.inventory.age(pair, self.positions.get(pair, ZERO), self.current_timestamp):.1f}s, "

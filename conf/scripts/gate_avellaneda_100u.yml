@@ -33,6 +33,19 @@ micro:
   caution_scale: '0.5'
   reprice_bps: '2'
   min_reprice_seconds: 2
+gamma_control:
+  enabled: true # per-pair risk aversion; fixed risk.gamma when false
+  minimum: '0.5'
+  maximum: '3'
+  volatility_weight: '0.5'
+  depth_weight: '0.5'
+  micro_weight: '0.5'
+  loss_weight: '1'
+  ema_seconds: 15
+  update_seconds: 3
+  max_step_ratio: '0.1'
+  reprice_bps: '2'
+  min_reprice_seconds: 2
 adaptive:
   enabled: true
   inventory_strength: '1' # inventory center adjustment, independent of quote width
@@ -70,7 +83,7 @@ risk:
   order_quote: '5'
   pair_loss_limit: '5'
   leverage: 1
-  gamma: '1' # legacy pricing when adaptive.enabled is false
+  gamma: '1' # adaptive baseline; also the fixed Gamma for legacy pricing
   eta: '1' # legacy opening size adjustment
   min_net_spread: '0.0002'
   max_book_spread: '0.005'

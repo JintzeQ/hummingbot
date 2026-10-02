@@ -44,7 +44,7 @@
 | `risk.order_quote` | 5 USDT | 每張普通造市單的名義金額上限；依交易規則向下取整 |
 | `risk.pair_loss_limit` | 5 USDT | 每幣本次入選期間的淨損益達 -5U，撤單後市價平倉並禁止本次運行再次選回 |
 | `risk.leverage` | 1 | 第一版只支援 1x，送單前確認設定成功 |
-| `risk.gamma` | 1 | `adaptive.enabled: false` 時使用的舊版 Gamma |
+| `risk.gamma` | 1 | 動態 Gamma 的基準；關閉 gamma_control 時固定使用，關閉 adaptive 時用於舊版公式 |
 | `risk.eta` | 1 | 關閉 adaptive 時使用的舊版庫存縮量係數 |
 | `adaptive.max_gross_quote` | 40 USDT | 兩幣持倉及增倉掛單的最壞成交組合總曝險 |
 | `adaptive.max_directional_quote` | 25 USDT | 兩幣合計多頭、合計空頭分別適用的上限 |
@@ -69,6 +69,37 @@ ask = r + spread/2
 
 `adaptive.enabled: true` 是預設。這是有邊界的規則控制，尚未接入學習器；參數需用記錄資料校準。
 
+### 每幣自適應 Gamma
+
+`gamma_control.enabled: true` 預設啟用。Gamma 表示庫存風險厭惡程度，每幣獨立更新。基準 `risk.gamma: 1`，預設限制在 0.5–3；啟用時基準必須落在上下限內。正常市場回到基準，不因獲利而主動降至基準以下。
+
+以當次有效市場資料及與 5U 停損相同口徑的每幣淨損益計算四個壓力值，每個限制在 `[0, 1]`：
+
+```text
+vol_stress = clip(vol_return / volatility_reference - 1)
+depth_stress = clip(1 - min(bid_depth, ask_depth) / (depth_target_multiple × order_quote))
+micro_stress = clip(max(unexplained_bid_loss, unexplained_ask_loss,
+                       |flow| if sufficient flow conflicts with the book else 0))
+loss_stress = clip(-pair_net_PnL / pair_loss_limit)
+gamma_target = clip_to_bounds(risk.gamma ×
+                (1 + 0.5 × vol_stress + 0.5 × depth_stress
+                   + 0.5 × micro_stress + 1 × loss_stress))
+```
+
+微結構已暫停時 `micro_stress = 1`；`micro.mode: observe` 或關閉微結構時不使用這項壓力，波動、深度及虧損仍有效。單純成交方向強、但與訂單簿沒有矛盾時，不另外加上 Gamma 成交方向壓力；原有單側風險溢價仍按其規則運作。庫存比例與持倉年齡已在下節控制，不再加入 Gamma 目標計算。
+
+第一次有效觀察從基準開始，每 3 秒最多更新一次，EMA 時間常數 15 秒，每次最多變動當時 Gamma 的 10%。帳戶未核對、資料過期、指標未暖機或輸入無效時凍結；重連或長時間空窗後只做一次有限更新，不補算漏過的更新。狀態保存在本次運行中，重啟重新從基準開始。
+
+Gamma 乘在非線性庫存壓力上，並乘在**開倉**價差的波動補償部分。多倉時 Gamma 提高會降低報價中心：減倉賣價更接近成交，新買入價更遠；空倉時反向處理。減倉側不額外加寬波動補償，因此不會因 Gamma 提高而把退出價格往更難成交的方向推。普通減倉仍保持 Maker 邊界。
+
+Gamma 不會放大庫存上限、單量上限或 100U 預算。成本下限、相關性篩選、共同曝險、只減倉條件及 5U 強制退出仍獨立生效。提高 Gamma 可能降低不利增倉，也可能降低成交率、犧牲部分平倉價差；不能據此推定淨盈利提升。
+
+例如其他壓力為零且每幣淨損益為 -4U 時，目標 Gamma 為 `1 × (1 + 4/5) = 1.8`，實際值會平滑靠近 1.8。到 -5U 時直接執行原有市價停損，不等 Gamma 慢慢調整。
+
+Gamma 導致擬掛價格變動至少兩個刻度或中間價的 2 bps（取較大者），且距上次送單至少 2 秒，才提前更新；微小變動保留普通 15 秒更新節奏。更新仍等待撤單、成交回報及 REST 核對。觀察模式也更新擬掛報價；`status` 分別顯示目前值、目標值、上次報價使用值及四項壓力，避免把擬掛價格與工作中訂單混為一談。
+
+`gamma_control.enabled: false` 固定使用 `risk.gamma`，其他自適應控制保留。`adaptive.enabled: false` 則回到前述舊版公式，停用這個動態控制器。此控制器延續本專案的報酬單位／非線性庫存規則；風險厭惡與庫存中心偏移的概念可參考 [Avellaneda–Stoikov 原論文](https://people.orie.cornell.edu/sfs33/LimitOrderBook.pdf)，本版動態目標、平滑與減倉處理不是該論文的原始最優解。
+
 ### 開倉與減倉分開判定
 
 新增曝險要符合成交量、深度、趨勢、波動、資金費及指標暖機條件，並通過擬掛報價的成本和距離檢查。市場最佳價差很窄時，可以在最佳價之外掛單，因此不再僅因最佳價差不足覆蓋費用而排除。
@@ -89,7 +120,7 @@ position_cap = max_position_quote × scale
 opening_order_quote = order_quote × scale
 q = signed_position × mid / position_cap
 urgency = 1 + min(3, inventory_age / 120)
-pressure = q × (1 + min(4, |q|²)) × urgency × inventory_strength × vol_return
+pressure = q × (1 + min(4, |q|²)) × urgency × inventory_strength × gamma × vol_return
 center = effective_reference - pressure × mid
 ```
 
@@ -120,13 +151,14 @@ effective_reference = mid + confidence × (micro_reference - mid)
 
 ```text
 kappa_return = kappa × mid
-base_half_return = spread_multiplier × (vol_return / 2 + ln(1 + 1/kappa_return))
-half_return_side = max(base_half_return + side_premium,
+opening_half_return = spread_multiplier × (gamma × vol_return / 2 + ln(1 + 1/kappa_return))
+close_half_return = spread_multiplier × (vol_return / 2 + ln(1 + 1/kappa_return))
+opening_half_side = max(opening_half_return + side_premium,
                        maker_fee + min_net_spread/2 + paying_carry + side_premium)
-proposed_bid/ask = center ∓ half_return_side × mid
+proposed_opening_bid/ask = center ∓ opening_half_side × mid
 ```
 
-`inventory_strength` 控制庫存中心偏移；`spread_multiplier` 獨立控制價差。預設報價使用報酬單位，價格縮放不會直接改變相對報價。開倉在價格刻度、Maker 邊界調整後，還要確認相對有效參考價的距離覆蓋 Maker 費、半邊目標空間及預期付出的資金費。
+`inventory_strength` 控制庫存中心偏移；`spread_multiplier` 獨立控制價差，Gamma 僅乘在庫存壓力及開倉波動部分。減倉從 `close_half_return` 套用相同側的費用／溢價下限及 Maker 邊界。預設報價使用報酬單位，價格縮放不會直接改變相對報價。開倉在價格刻度、Maker 邊界調整後，還要確認相對有效參考價的距離覆蓋 Maker 費、半邊目標空間及預期付出的資金費。
 
 資金費按 120 秒預期持有時間占實際合約資金費間隔的比例估算；若已知下一次結算落在這 120 秒內，付款方向至少計入一次完整費率。收取資金費的方向不以收入抵銷開倉成本門檻。這是成本估算，持有更久或費率改變仍可能超出估計。
 
@@ -228,10 +260,10 @@ status
 python -m unittest discover -s test/hummingbot/strategy/gate_avellaneda -v
 ```
 
-184 個測試包括選幣、確認與冷卻、共享預算、持倉上限、部分成交、Maker／市價減倉、撤單確認、REST 持倉延遲及核對、失去連線、訂單／帳務分頁和 Gate 生產方法回歸。5U 停損涵蓋費用／資金費、獲利抵銷、晚到帳務、不重複計算、精確門檻、多／空倉市價退出、撤單後晚到成交、部分平倉、禁止選回及補位。微結構涵蓋價格平滑、減倉保留、成交配對、異常確認／恢復／退出、序號／重連／過期資料及 Gate 資料掛鉤。
+215 個測試包括選幣、確認與冷卻、共享預算、持倉上限、部分成交、Maker／市價減倉、撤單確認、REST 持倉延遲及核對、失去連線、訂單／帳務分頁和 Gate 生產方法回歸。5U 停損涵蓋費用／資金費、獲利抵銷、晚到帳務、不重複計算、精確門檻、多／空倉市價退出、撤單後晚到成交、部分平倉、禁止選回及補位。微結構涵蓋價格平滑、減倉保留、成交配對、異常確認／恢復／退出、序號／重連／過期資料及 Gate 資料掛鉤。
 
-自適應測試涵蓋開倉與減倉分離、非線性／時間庫存、不同訂單和交錯部分成交、縮量與撤單核對、微價格可信度、成本與價格單位一致性、正負資金費結算、共同曝險取整與所有測試掛單成交子集合、相關性暖機／缺口／過期／替補，以及連續停損暫停和持續健康恢復。適配器使用交易所和 Hummingbot 介面的替身，無需 API Key，不送出網路交易。
+自適應測試涵蓋開倉與減倉分離、非線性／時間庫存、不同訂單和交錯部分成交、縮量與撤單核對、微價格可信度、成本與價格單位一致性、正負資金費結算、共同曝險取整與所有測試掛單成交子集合、相關性暖機／缺口／過期／替補，以及連續停損暫停和持續健康恢復。Gamma 測試涵蓋上下限、四項壓力、每幣獨立狀態、平滑／限速、重複 tick／空窗／無效資料、固定模式、價格單位、減倉方向、成本及預算邊界、微小變動不重掛、觀察模式重報與 5U 優先退出。適配器使用交易所和 Hummingbot 介面的替身，無需 API Key，不送出網路交易。
 
-本地追蹤的行覆蓋率：純策略核心 99.6%、微結構模組 98.2%、自適應控制 97.6%、腳本適配器 96.7%。這代表替身測試執行到的程式行，不代表實盤正確率。
+本地追蹤的行覆蓋率：純策略核心 99.6%、微結構模組 98.2%、自適應控制 97.6%、Gamma 控制 98.8%、腳本適配器 97.0%。這代表替身測試執行到的程式行，不代表實盤正確率。
 
 此版本未進行 Gate 實盤端到端測試，也未在完整編譯的 Hummingbot 環境執行原有整套測試。自適應規則及微結構門檻尚未經回測或實盤校準，有限候選池不會熱更新，停止後仍需確認剩餘部位。尚未新增全帳戶每日虧損上限、成交後價格變化學習器或排隊成交機率模型。增加這些控制不代表已驗證能提高盈利；需先用實際資料比較淨價差、成交後價格變化、費用、資金費及退出成本。

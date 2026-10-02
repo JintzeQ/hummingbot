@@ -5,6 +5,7 @@ from decimal import Decimal as D
 
 from hummingbot.strategy.gate_avellaneda.adaptive import AdaptiveSettings
 from hummingbot.strategy.gate_avellaneda.core import Intent
+from hummingbot.strategy.gate_avellaneda.gamma import GammaController, GammaSettings
 from hummingbot.strategy.gate_avellaneda.microstructure import MicroSettings
 from test.hummingbot.strategy.gate_avellaneda.support import FakeConnector, OrderType, PositionAction, contract, load_adapter
 
@@ -258,3 +259,136 @@ class AdaptiveAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.bot.on_tick()
         self.assertTrue(self.bot.entry_allowed)
         self.assertEqual(len(self.bot.portfolio.slots), 2)
+
+    def test_gamma_config_checks_baseline_and_keeps_legacy_mode_available(self):
+        with self.assertRaises(ValueError):
+            adapter.GateAvellanedaPortfolioConfig(risk={"gamma": "4"})
+        fixed = adapter.GateAvellanedaPortfolioConfig(risk={"gamma": "4"}, gamma_control={"enabled": False})
+        self.assertEqual(fixed.risk.gamma, 4)
+        legacy = adapter.GateAvellanedaPortfolioConfig(risk={"gamma": "4"}, adaptive={"enabled": False})
+        self.assertEqual(legacy.risk.gamma, 4)
+
+    async def test_pair_net_loss_adapts_gamma_without_affecting_other_pair(self):
+        await self.ready()
+        await self.positions({"A-USDT": D("1")}, pnl="-4")
+        self.bot.on_tick()
+        for now in (102, 103, 104):
+            self.frame(now)
+        self.bot.on_tick()
+        self.assertGreater(self.bot.gamma.value("A-USDT"), 1)
+        self.assertEqual(self.bot.gamma.states["A-USDT"].target, D("1.8"))
+        self.assertEqual(self.bot.gamma.value("B-USDT"), 1)
+        self.assertEqual(self.bot.plans["A-USDT"].gamma, self.bot.gamma.value("A-USDT"))
+        self.assertIn("gamma_target=1.8", self.bot.format_status())
+
+    async def test_material_gamma_change_waits_for_cancel_and_rest_before_requote(self):
+        await self.ready()
+        await self.positions({"A-USDT": D("1")})
+        self.bot.on_tick()
+        before = len(self.connector.sent)
+        old_a = {oid for oid, order in self.bot.orders.items() if order.intent.pair == "A-USDT"}
+        for now in (102, 103, 104):
+            self.frame(now)
+        state = self.bot.gamma.states["A-USDT"]
+        state.value, state.updated_at = D("3"), 104
+        self.bot.on_tick()
+        self.assertTrue(old_a.issubset(set(self.connector.cancels)))
+        self.assertEqual(len(self.connector.sent), before)
+        self.clear_orders()
+        await self.bot._refresh()
+        self.frame(105)
+        self.bot.on_tick()
+        self.assertEqual(self.bot.last_gamma_values["A-USDT"], D("3"))
+        self.assertTrue(any(order[2] == "A-USDT" for order in self.connector.sent[before:]))
+
+    async def test_tiny_gamma_change_does_not_churn_working_quotes(self):
+        await self.ready()
+        self.bot.on_tick()
+        for now in (102, 103, 104):
+            self.frame(now)
+        state = self.bot.gamma.states["A-USDT"]
+        state.value, state.updated_at = D("1.001"), 104
+        self.bot.on_tick()
+        self.assertEqual(self.connector.cancels, [])
+        self.assertEqual(len(self.connector.sent), 4)
+        self.assertEqual(self.bot.last_gamma_values["A-USDT"], 1)
+
+    async def test_gamma_reprice_respects_minimum_submission_interval(self):
+        await self.ready()
+        await self.positions({"A-USDT": D("1")})
+        self.bot.on_tick()
+        state = self.bot.gamma.states["A-USDT"]
+        state.value, state.updated_at = D("3"), 102
+        self.frame(102)
+        self.bot.on_tick()
+        self.assertEqual(self.connector.cancels, [])
+        self.frame(103)
+        self.bot.on_tick()
+        self.assertTrue(self.connector.cancels)
+        self.assertEqual(len(self.connector.sent), 4)
+
+    async def test_gamma_does_not_update_on_stale_book_or_unreconciled_account(self):
+        await self.ready()
+        await self.positions({"A-USDT": D("1")}, pnl="-4")
+        self.bot.on_tick()
+        state = self.bot.gamma.states["A-USDT"]
+        self.frame(104)
+        self.bot.account_dirty = True
+        self.bot.on_tick()
+        self.assertEqual(state.updated_at, 101)
+        self.bot.account_dirty = False
+        self.bot.signal_feed.reset()
+        self.bot.on_tick()
+        self.assertEqual(state.updated_at, 101)
+        self.assertEqual(state.value, 1)
+
+    async def test_observe_mode_does_not_apply_micro_stress_to_gamma(self):
+        self.config.micro = replace(self.config.micro, mode="observe")
+        await self.ready()
+        self.bot.on_tick()
+        self.bot.signal_feed.observe_trade("A-USDT", 1, 102, "9.99", "10", False, 102)
+        for now in (102, 103, 104):
+            self.frame(now, a_bids=[dict(p="9.99", s="500000")])
+        self.bot.on_tick()
+        self.assertTrue(self.bot.signals["A-USDT"].book_flow_conflict)
+        self.assertEqual(self.bot.gamma.states["A-USDT"].components["micro"], 0)
+        self.assertEqual(self.bot.gamma.value("A-USDT"), 1)
+
+    async def test_fixed_gamma_is_connected_to_adaptive_quotes(self):
+        self.config.risk = replace(self.config.risk, gamma=D("2"))
+        self.config.gamma_control = GammaSettings(enabled=False)
+        self.bot.gamma = GammaController(self.config.risk, self.config.adaptive, self.config.gamma_control)
+        await self.ready()
+        self.bot.on_tick()
+        self.assertEqual(self.bot.plans["A-USDT"].gamma, 2)
+        self.assertEqual(self.bot.gamma.states, {})
+        self.assertIn("gamma_mode=fixed", self.bot.format_status())
+
+    async def test_high_gamma_cannot_delay_loss_market_exit_with_stale_ws(self):
+        await self.ready()
+        self.bot.on_tick()
+        self.bot.gamma.states["A-USDT"].value = D("3")
+        self.clear_orders()
+        await self.positions({"A-USDT": D("1")}, pnl="-5")
+        self.bot.signal_feed.reset()
+        self.bot.on_tick()
+        close = self.connector.sent[-1]
+        self.assertEqual(close[2], "A-USDT")
+        self.assertEqual(close[3], D("1"))
+        self.assertEqual(close[4], OrderType.MARKET)
+        self.assertEqual(close[5]["position_action"], PositionAction.CLOSE)
+
+    async def test_observation_quotes_also_refresh_on_material_gamma_change(self):
+        self.config.dry_run = True
+        await self.ready()
+        await self.positions({"A-USDT": D("1")})
+        self.bot.on_tick()
+        old_prices = [intent.price for intent in self.bot.last_quotes["A-USDT"]]
+        for now in (102, 103, 104):
+            self.frame(now)
+        state = self.bot.gamma.states["A-USDT"]
+        state.value, state.updated_at = D("3"), 104
+        self.bot.on_tick()
+        self.assertNotEqual(old_prices, [intent.price for intent in self.bot.last_quotes["A-USDT"]])
+        self.assertEqual(self.bot.last_gamma_values["A-USDT"], 3)
+        self.assertEqual(self.connector.sent, [])

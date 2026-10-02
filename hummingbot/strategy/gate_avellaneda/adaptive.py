@@ -76,6 +76,7 @@ class AdaptiveSettings:
 
 @dataclass
 class QuotePlan:
+    gamma: Decimal = ONE
     reference: Decimal = ZERO
     confidence: Decimal = ZERO
     buy_premium: Decimal = ZERO
@@ -135,13 +136,16 @@ def _close_quote(market, position, risk, price):
 
 def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, settings: AdaptiveSettings,
                now: float, signal: Optional[MicroSignal] = None, allow_open: bool = True,
-               blocked_side: Optional[bool] = None) -> QuotePlan:
-    plan = QuotePlan()
+               blocked_side: Optional[bool] = None, gamma: Optional[Decimal] = None) -> QuotePlan:
+    gamma = risk.gamma if gamma is None else gamma
+    plan = QuotePlan(gamma=gamma)
     unsafe = market.close_rejection(risk, now)
     if unsafe:
         plan.entry_reason = unsafe
         return plan
     reason = market.rejection(risk, now, quoted_economics=True)
+    if not gamma.is_finite() or gamma <= 0:
+        reason = "invalid effective Gamma"
     if (not math.isfinite(market.funding_interval) or market.funding_interval <= 0
             or not math.isfinite(market.funding_next_at)):
         reason = "invalid funding schedule"
@@ -159,21 +163,26 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     ratio = abs(q)
     urgency = ONE + min(D("3"), D(str(max(0, age) / settings.age_ramp_seconds)))
     plan.pressure = (q * (ONE + min(D("4"), ratio ** settings.inventory_power)) * urgency
-                     * settings.inventory_strength * market.volatility / market.mid)
+                     * settings.inventory_strength * gamma * market.volatility / market.mid)
     plan.stage = ("reduce_only" if ratio >= settings.reduce_only_ratio or age >= 2 * settings.age_ramp_seconds
                   or not allow_open or (signal is not None and signal.paused) else
                   "caution" if ratio >= settings.soft_ratio or age >= settings.age_ramp_seconds else "normal")
     # kappa is inverse price; kappa*mid and volatility/mid share return units.
     liquidity = (ONE + ONE / (market.kappa * market.mid)).ln()
     base_half = settings.spread_multiplier * (market.volatility / market.mid / 2 + liquidity)
+    opening_half = settings.spread_multiplier * (gamma * market.volatility / market.mid / 2 + liquidity)
     fee_floor = max(ZERO, market.maker_fee) + risk.min_net_spread / 2
     center = plan.reference - plan.pressure * market.mid
-    prices = {}
+    prices, close_prices = {}, {}
     for buy in (True, False):
         premium = plan.buy_premium if buy else plan.sell_premium
-        half = max(base_half + premium, fee_floor + _carry(market, buy, now, settings) + premium)
+        floor = fee_floor + _carry(market, buy, now, settings) + premium
+        half = max(opening_half + premium, floor)
         prices[buy] = center + (-ONE if buy else ONE) * half * market.mid
-    close_price = prices[position < 0]
+        # Greater risk aversion improves inventory reduction through the center;
+        # it must not widen the reducing side's volatility component.
+        close_prices[buy] = center + (-ONE if buy else ONE) * max(base_half + premium, floor) * market.mid
+    close_price = close_prices[position < 0]
     plan.intents = _close_quote(market, position, risk, close_price)
     opens = []
     for buy in (True, False):
@@ -213,8 +222,8 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     return plan
 
 
-def entry_rejection(market, risk, settings, now, signal=None):
-    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal)
+def entry_rejection(market, risk, settings, now, signal=None, gamma=None):
+    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal, gamma=gamma)
     return None if len(plan.intents) == 2 else plan.entry_reason or "no executable adaptive opening"
 
 
