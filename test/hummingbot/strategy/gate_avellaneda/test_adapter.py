@@ -37,7 +37,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.refresh_task
 
     def position(self, pair, size):
-        return dict(contract=pair.replace("-", "_"), size=str(size), mode="single", mark_price="10")
+        return dict(contract=pair.replace("-", "_"), size=str(size), mode="single", mark_price="10",
+                    unrealised_pnl="0")
 
     async def test_observer_selects_two_and_never_sends(self):
         await self.ready()
@@ -111,7 +112,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.bot.positions = {"A-USDT": D("0.1")}
         self.bot.expected_positions = {"A-USDT": D("0.1")}
         self.bot.position_quote = {"A-USDT": D("1")}
-        self.bot.exchange_open_pairs = {"A-USDT"}
+        self.bot.exchange_open_pairs = set()
         self.bot.next_monitor = 999
         self.bot.on_tick()
         await self.finish_task()
@@ -349,6 +350,252 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No qualifying", self.bot.format_status())
         self.bot.halt_reason = "test"
         self.assertIn("HALTED", self.bot.format_status())
+
+    def book_record(self, record_id, change, kind="pnl", pair="A-USDT", timestamp=100):
+        return dict(id=str(record_id), change=str(change), type=kind,
+                    contract=pair.replace("-", "_"), time=timestamp)
+
+    async def selected(self):
+        await self.ready(live=True)
+        self.bot.portfolio.evaluate(self.bot._snapshots(), 100, True, {}, set())
+        self.bot.next_account = self.bot.next_monitor = 999
+
+    async def test_pair_net_pnl_sums_settlements_fees_funding_and_float(self):
+        await self.selected()
+        self.connector.account_book = [self.book_record(1, "-0.5"),
+                                       self.book_record(2, "-0.5", "fee"),
+                                       self.book_record(3, "-0.5", "fund")]
+        position = dict(self.position("A-USDT", 1000), unrealised_pnl="-3.5", realised_pnl="-1.5")
+        self.connector.positions = [position]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        # realised_pnl repeats the settlements and must not be added again.
+        self.assertEqual(self.bot._pair_pnl("A-USDT"), D("-5"))
+        self.assertEqual(self.bot._pair_pnl("B-USDT"), D("0"))
+        self.assertIn("net_PnL=-5.0", self.bot.format_status())
+
+    async def test_pair_net_pnl_offsets_profit_and_ignores_transfers_other_pairs(self):
+        await self.selected()
+        self.connector.account_book = [self.book_record(1, "-3"), self.book_record(2, "2"),
+                                       self.book_record(3, "-0.4", "fee"),
+                                       self.book_record(4, "-0.6", "fund"),
+                                       self.book_record(5, "100", "dnw"),
+                                       self.book_record(6, "-100", pair="C-USDT")]
+        await self.bot._refresh()
+        self.assertEqual(self.bot._pair_pnl("A-USDT"), D("-2"))
+        self.bot.on_tick()
+        self.assertNotIn("A-USDT", self.bot.portfolio.excluded)
+
+    async def test_old_records_initial_baseline_and_previous_selection_do_not_count(self):
+        self.connector.account_book = [self.book_record(1, "-100")]
+        await self.ready(live=True)
+        self.bot.portfolio.evaluate(self.bot._snapshots(), 101, True, {}, set())
+        self.bot.current_timestamp = 110
+        self.connector.account_book.extend([self.book_record(2, "-100", timestamp=100.5),
+                                           self.book_record(3, "-2", timestamp=101),
+                                           self.book_record(4, "-1", "fee", timestamp=110)])
+        await self.bot._refresh()
+        self.assertEqual(self.bot._pair_pnl("A-USDT"), D("-3"))
+
+    async def test_late_settlement_is_captured_and_repeated_refresh_never_double_counts(self):
+        await self.selected()
+        self.bot.current_timestamp = 120
+        await self.bot._refresh()
+        # The record appears late, with a timestamp from an earlier poll.
+        self.connector.account_book = [self.book_record(1, "-5", timestamp=101)]
+        await self.bot._refresh()
+        self.assertEqual(self.bot._pair_pnl("A-USDT"), D("-5"))
+        await self.bot._refresh()
+        self.assertEqual(self.bot._pair_pnl("A-USDT"), D("-5"))
+
+    async def test_loss_stop_immediately_uses_market_for_long_and_short(self):
+        for size in (1000, -1000):
+            with self.subTest(size=size):
+                self.setUp()
+                await self.selected()
+                self.config.allow_market_exit = False
+                self.connector.positions = [dict(self.position("A-USDT", size), unrealised_pnl="-5")]
+                self.bot.expected_positions = {"A-USDT": D(size) / 1000}
+                await self.bot._refresh()
+                self.bot.on_tick()
+                stops = [o for o in self.connector.sent if o[2] == "A-USDT"]
+                self.assertEqual(len(stops), 1)
+                self.assertEqual(stops[0][4], OrderType.MARKET)
+                self.assertEqual(stops[0][3], D("1"))
+                self.assertEqual(stops[0][1], size < 0)
+                self.assertEqual(stops[0][5]["position_action"], PositionAction.CLOSE)
+                self.assertTrue(self.bot.portfolio.slots["A-USDT"].force_market)
+                self.assertNotIn("C-USDT", self.bot.portfolio.slots)
+
+    async def test_loss_stop_cancels_both_open_and_maker_close_before_market(self):
+        await self.selected()
+        self.bot._submit(Intent("A-USDT", True, D("0.1"), D("9.99")))
+        self.bot._submit(Intent("A-USDT", False, D("0.5"), D("10.01"), close=True))
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="-5")]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertEqual(set(self.connector.cancels), {"t-1", "t-2"})
+        self.assertFalse(any(o[4] == OrderType.MARKET for o in self.connector.sent))
+        for oid in list(self.bot.orders):
+            self.bot.did_cancel_order(types.SimpleNamespace(order_id=oid))
+        # Local cancel callbacks alone are insufficient: exchange still lists them.
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertFalse(self.bot.halt_reason)
+        self.assertFalse(any(o[4] == OrderType.MARKET for o in self.connector.sent))
+        self.connector.open_orders = []
+        await self.bot._refresh()
+        self.bot.on_tick()
+        stops = [o for o in self.connector.sent if o[2] == "A-USDT" and o[4] == OrderType.MARKET]
+        self.assertEqual(len(stops), 1)
+
+    async def test_stop_partial_close_and_delayed_rest_block_replacement_until_flat(self):
+        await self.selected()
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="-5")]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        self.bot.on_tick()
+        oid = next(k for k, o in self.bot.orders.items() if o.intent.pair == "A-USDT")
+        self.bot.did_fill_order(types.SimpleNamespace(order_id=oid, amount=D("0.4")))
+        self.bot.did_complete_sell_order(types.SimpleNamespace(order_id=oid))
+        self.connector.open_orders = [o for o in self.connector.open_orders if o["text"] != oid]
+        self.connector.positions = [dict(self.position("A-USDT", 600), unrealised_pnl="-1")]
+        await self.bot._refresh()
+        self.bot.on_tick()
+        remaining = next(k for k, o in self.bot.orders.items() if o.intent.pair == "A-USDT")
+        self.assertEqual(self.bot.orders[remaining].intent.amount, D("0.6"))
+        self.assertTrue(self.bot.orders[remaining].intent.market)
+        self.assertNotIn("C-USDT", self.bot.portfolio.slots)
+        self.bot.did_fill_order(types.SimpleNamespace(order_id=remaining, amount=D("0.6")))
+        self.bot.did_complete_sell_order(types.SimpleNamespace(order_id=remaining))
+        self.connector.open_orders = [o for o in self.connector.open_orders if o["text"] != remaining]
+        # The final close is confirmed by fills, but the REST position is delayed.
+        await self.bot._refresh()
+        self.assertTrue(self.bot.account_dirty)
+        self.bot.on_tick()
+        self.assertNotIn("C-USDT", self.bot.portfolio.slots)
+        self.connector.positions = []
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertEqual(set(self.bot.portfolio.slots), {"B-USDT", "C-USDT"})
+        self.assertIn("A-USDT", self.bot.portfolio.excluded)
+
+    async def test_flat_realised_loss_triggers_replacement_without_a_close_order(self):
+        await self.selected()
+        self.connector.account_book = [self.book_record(1, "-5")]
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertEqual(set(self.bot.portfolio.slots), {"B-USDT", "C-USDT"})
+        self.assertFalse(any(o[2] == "A-USDT" for o in self.connector.sent))
+
+    async def test_stop_still_executes_when_market_book_missing_and_indicators_unready(self):
+        await self.selected()
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="-5")]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        del self.bot.books["A-USDT"]
+        self.bot.on_tick()
+        stops = [o for o in self.connector.sent if o[2] == "A-USDT"]
+        self.assertEqual(stops[0][4], OrderType.MARKET)
+
+    async def test_stale_account_cannot_trigger_or_submit_a_loss_stop(self):
+        await self.selected()
+        self.bot.positions = {"A-USDT": D("1")}
+        self.bot.position_marks = {"A-USDT": D("10")}
+        self.bot.unrealised_pnl = {"A-USDT": D("-5")}
+        self.bot.account_dirty = True
+        self.bot.on_tick()
+        self.assertEqual(self.connector.sent, [])
+        self.assertIsNone(self.bot._exit_intent("A-USDT", None, 100, force_market=True))
+
+    async def test_account_book_paginates_fixed_window_and_deduplicates_by_id(self):
+        await self.selected()
+        self.connector.account_book = [self.book_record(i, "-0.001") for i in range(1001)]
+        rows = await self.bot._account_book()
+        self.assertEqual(len(rows), 1001)
+        requests = [kwargs["params"] for path, kwargs in self.connector.requests if path == "futures/usdt/account_book"]
+        self.assertEqual(requests[-2]["offset"], 0)
+        self.assertEqual(requests[-1]["offset"], 1000)
+        self.assertEqual(requests[-2]["from"], requests[-1]["from"])
+        self.assertEqual(requests[-2]["to"], requests[-1]["to"])
+        self.connector.account_book = [self.book_record(1, "-1"), self.book_record(1, "-1")]
+        with self.assertRaisesRegex(RuntimeError, "pagination"):
+            await self.bot._account_book()
+
+    async def test_ledger_pagination_limit_halts_instead_of_using_incomplete_losses(self):
+        await self.selected()
+        self.connector.account_book = [self.book_record(i, "-0.001") for i in range(10000)]
+        await self.bot._refresh()
+        self.assertIn("Account-book pagination limit", self.bot.halt_reason)
+        self.assertTrue(self.bot.account_dirty)
+
+    async def test_invalid_ledger_data_and_non_usdt_fees_are_rejected(self):
+        await self.selected()
+        for changes in (dict(change="NaN"), dict(time=float("nan")), dict(id=""), dict(id=None),
+                        dict(contract=""), dict(type="point_fee"), dict(type="bonus_offset")):
+            with self.subTest(changes=changes):
+                self.connector.account_book = [dict(self.book_record(1, "-1"), **changes)]
+                # Test malformed time directly; fake range filtering would hide NaN.
+                with patch.object(self.connector, "_api_get", AsyncMock(return_value=self.connector.account_book)):
+                    with self.assertRaises(ValueError):
+                        await self.bot._account_book()
+
+    async def test_ledger_failure_pauses_new_orders_and_never_fakes_zero_loss(self):
+        await self.selected()
+        original = self.connector._api_get
+
+        async def failure(path_url, **kwargs):
+            if path_url == "futures/usdt/account_book":
+                raise OSError("ledger unavailable")
+            return await original(path_url, **kwargs)
+
+        self.connector._api_get = failure
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertTrue(self.bot.account_dirty)
+        self.assertEqual(self.connector.sent, [])
+
+    async def test_invalid_unrealised_pnl_and_dry_run_stop_never_submit(self):
+        await self.selected()
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="NaN")]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        self.assertIn("Invalid per-pair", self.bot.halt_reason)
+        self.setUp()
+        await self.ready()
+        self.bot.portfolio.evaluate(self.bot._snapshots(), 100, True, {}, set())
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="-5")]
+        await self.bot._refresh()
+        self.bot.on_tick()
+        self.assertIn("A-USDT", self.bot.portfolio.excluded)
+        self.assertEqual(self.connector.sent, [])
+
+    async def test_late_open_fill_after_cancel_is_reconciled_before_stop_close(self):
+        await self.selected()
+        self.bot._submit(Intent("A-USDT", True, D("0.1"), D("9.99")))
+        self.bot.did_cancel_order(types.SimpleNamespace(order_id="t-1"))
+        self.bot.did_fill_order(types.SimpleNamespace(order_id="t-1", amount=D("0.1")))
+        self.assertEqual(self.bot.expected_positions["A-USDT"], D("0.1"))
+        self.assertTrue(self.bot.account_dirty)
+        self.connector.open_orders = []
+        self.connector.positions = [dict(self.position("A-USDT", 100), unrealised_pnl="-5")]
+        await self.bot._refresh()
+        self.bot.on_tick()
+        closes = [o for o in self.connector.sent if o[4] == OrderType.MARKET]
+        self.assertEqual(closes[0][3], D("0.1"))
+
+    async def test_pending_market_stop_waits_for_fill_without_duplicate_close_or_cancel(self):
+        await self.selected()
+        self.connector.positions = [dict(self.position("A-USDT", 1000), unrealised_pnl="-5")]
+        self.bot.expected_positions = {"A-USDT": D("1")}
+        await self.bot._refresh()
+        self.bot.on_tick()
+        stop_id = next(oid for oid, o in self.bot.orders.items() if o.intent.pair == "A-USDT")
+        self.bot.on_tick()
+        self.bot.on_tick()
+        self.assertNotIn(stop_id, self.connector.cancels)
+        self.assertEqual(len([o for o in self.connector.sent if o[2] == "A-USDT"]), 1)
 
 
 class BootstrapTests(unittest.TestCase):

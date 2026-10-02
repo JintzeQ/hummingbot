@@ -138,6 +138,7 @@ class FakeConnector:
         self.tickers = [dict(contract=p.replace("-", "_"), last="10", volume_24h_quote="10000000",
                              funding_rate_indicative="0.0001") for p in pairs]
         self.positions = []
+        self.account_book = []
         self.open_orders = []
         self.account = dict(available="100", total="100", unrealised_pnl="0")
         self.book = dict(bids=[dict(p="9.99", s="100000")], asks=[dict(p="10.01", s="100000")])
@@ -154,6 +155,10 @@ class FakeConnector:
             raise self.error
         if path_url == "positions":
             return self.positions
+        if path_url == "futures/usdt/account_book":
+            params = kwargs["params"]
+            rows = [r for r in self.account_book if params["from"] <= float(r["time"]) < params["to"] + 1]
+            return rows[params["offset"]:params["offset"] + params["limit"]]
         if path_url == "orders":
             offset = kwargs.get("params", {}).get("offset", 0)
             return self.open_orders[offset:offset + 100]

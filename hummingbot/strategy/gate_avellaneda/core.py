@@ -16,6 +16,7 @@ class Settings:
     pair_margin: Decimal = D("40")
     max_position_quote: Decimal = D("20")
     order_quote: Decimal = D("5")
+    pair_loss_limit: Decimal = D("5")
     leverage: int = 1
     gamma: Decimal = D("1")
     eta: Decimal = D("1")
@@ -35,7 +36,8 @@ class Settings:
         decimals = [v for v in vars(self).values() if isinstance(v, D)]
         if any(not v.is_finite() for v in decimals):
             raise ValueError("Settings must be finite")
-        if min(self.capital, self.pair_margin, self.max_position_quote, self.order_quote, self.gamma) <= 0:
+        if min(self.capital, self.pair_margin, self.max_position_quote, self.order_quote,
+               self.pair_loss_limit, self.gamma) <= 0:
             raise ValueError("Capital, budgets, order size and gamma must be positive")
         if self.reserve < 0 or 2 * self.pair_margin + self.reserve > self.capital:
             raise ValueError("Two pair budgets plus reserve must fit total capital")
@@ -130,6 +132,8 @@ class Slot:
     failures: int = 0
     reason: str = ""
     retiring_since: float = 0
+    selected_at: float = 0
+    force_market: bool = False
 
 
 class Portfolio:
@@ -139,6 +143,7 @@ class Portfolio:
         self.settings = settings
         self.slots: Dict[str, Slot] = {}
         self.cooldowns: Dict[str, float] = {}
+        self.excluded: Set[str] = set()
 
     def evaluate(self, markets: Dict[str, Market], now: float, account_fresh: bool,
                  positions: Dict[str, Decimal], open_pairs: Set[str], allow_entries: bool = True) -> None:
@@ -162,17 +167,30 @@ class Portfolio:
         if not allow_entries:
             return
         candidates = sorted(
-            (m for m in markets.values() if m.pair not in self.slots
+            (m for m in markets.values() if m.pair not in self.slots and m.pair not in self.excluded
              and now >= self.cooldowns.get(m.pair, 0) and m.rejection(self.settings, now) is None),
             key=lambda m: (-m.score(), m.pair),
         )
         for market in candidates[:max(0, 2 - len(self.slots))]:
-            self.slots[market.pair] = Slot(market.pair)
+            self.slots[market.pair] = Slot(market.pair, selected_at=now)
 
     def retire(self, pair: str, reason: str, now: float) -> None:
         slot = self.slots[pair]
         if slot.state != "retiring":
             slot.state, slot.reason, slot.retiring_since = "retiring", reason, now
+
+    def stop_loss(self, pair: str, pnl: Decimal, now: float) -> bool:
+        """Latch the loss exit; recovery cannot re-enable this pair this run."""
+        if pair not in self.slots or pair in self.excluded or not pnl.is_finite():
+            return False
+        if pnl > -self.settings.pair_loss_limit:
+            return False
+        self.retire(pair, f"pair loss limit reached: net PnL {pnl} USDT", now)
+        slot = self.slots[pair]
+        slot.reason = f"pair loss limit reached: net PnL {pnl} USDT"
+        slot.force_market = True
+        self.excluded.add(pair)
+        return True
 
 
 @dataclass(frozen=True)

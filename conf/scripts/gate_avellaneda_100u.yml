@@ -17,6 +17,7 @@ risk:
   pair_margin: '40'
   max_position_quote: '20'
   order_quote: '5'
+  pair_loss_limit: '5'
   leverage: 1
   gamma: '1'
   eta: '1'

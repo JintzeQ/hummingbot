@@ -7,6 +7,7 @@ list. A restart rebuilds the pool from the current futures volume ranking.
 
 import asyncio
 import json
+import math
 import os
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -94,12 +95,21 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.indicators = {}
         self.history = {p: deque(maxlen=config.sample_ticks) for p in self.contracts}
         self.orders: Dict[str, TrackedOrder] = {}
+        # Retain ownership through delayed REST cancellation visibility and
+        # any final fill delivered after a terminal callback.
+        self.terminal_orders: Dict[str, TrackedOrder] = {}
         self.positions = {}
         self.position_quote = {}
+        self.position_marks = {}
+        self.unrealised_pnl = {}
+        self.cashflows = {}
+        self.initial_book_ids = set()
+        self.run_started_at = None
         # Live starts flat. Track signed fills independently of potentially
         # delayed REST positions; a flat response alone cannot release a slot.
         self.expected_positions = {}
         self.exchange_open_pairs = set()
+        self.exchange_open_ids = set()
         self.available = ZERO
         self.equity = ZERO
         self.account_at = 0
@@ -143,6 +153,12 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if now - self.account_at > self.config.risk.max_age:
                 self._cancel_all()
             return
+        for pair in list(self.portfolio.slots):
+            if self.portfolio.stop_loss(pair, self._pair_pnl(pair), now):
+                self.logger().warning(self.portfolio.slots[pair].reason + f"; exiting {pair} at market")
+                self._cancel_pair(pair)
+                # An already-flat loss exit can be replaced on this tick.
+                self.next_monitor = 0
         if now >= self.next_monitor:
             before = {(p, s.state) for p, s in self.portfolio.slots.items()}
             self.portfolio.evaluate(snapshots, now, fresh, self.positions,
@@ -166,10 +182,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self._cancel_pair(pair)
                     continue
                 if existing:
-                    if now >= self.next_quote.get(pair, 0):
+                    if ((slot.force_market and any(not o.intent.market for o in existing))
+                            or (not slot.force_market and now >= self.next_quote.get(pair, 0))):
                         self._cancel_pair(pair)
                     continue
-                exit_intent = self._exit_intent(pair, market, slot.retiring_since)
+                if pair in self.exchange_open_pairs:
+                    self._cancel_pair(pair)
+                    continue
+                exit_intent = self._exit_intent(pair, market, slot.retiring_since, slot.force_market)
                 if exit_intent:
                     intents.append(exit_intent)
                 continue
@@ -181,11 +201,16 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if any(o.intent.pair == pair for o in self.orders.values()):
                 self._cancel_pair(pair)
                 continue
+            if pair in self.exchange_open_pairs:
+                self._cancel_pair(pair)
+                continue
             intents.extend(avellaneda_quotes(market, self.positions.get(pair, ZERO), self.config.risk))
         if not intents:
             return
         outstanding = {}
-        for order in self.orders.values():
+        pending = list(self.orders.values())
+        pending.extend(o for oid, o in self.terminal_orders.items() if oid in self.exchange_open_ids)
+        for order in pending:
             if not order.intent.close:
                 pair = order.intent.pair
                 outstanding[pair] = outstanding.get(pair, ZERO) + order.remaining * order.intent.price * Decimal("1.01")
@@ -264,11 +289,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
 
     async def _refresh(self):
         try:
+            if self.run_started_at is None:
+                self.run_started_at = self.current_timestamp
             epoch = self.account_epoch
-            positions, account, open_orders = await asyncio.gather(
+            positions, account, open_orders, cashflows = await asyncio.gather(
                 self.connector._api_get(path_url=C.POSITION_INFORMATION_URL, is_auth_required=True),
                 self.connector._api_get(path_url=C.USER_BALANCES_PATH_URL, is_auth_required=True),
                 self._open_orders(),
+                self._account_book(),
             )
             if epoch != self.account_epoch:
                 return
@@ -277,11 +305,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 if nonzero or open_orders:
                     raise ValueError("Start requires a flat futures account with no exchange open orders; reconcile existing exposure first")
                 await self._setup_live()
-            unknown = [o for o in open_orders if o.get("text") not in self.orders]
+            unknown = [o for o in open_orders if o.get("text") not in self.orders
+                       and o.get("text") not in self.terminal_orders]
             if unknown and not self.config.dry_run:
                 raise ValueError("Unowned exchange orders detected; new submissions paused")
             converted = {}
             position_quote = {}
+            position_marks = {}
+            unrealised_pnl = {}
             for position in nonzero:
                 pair = position["contract"].replace("_", "-")
                 if pair not in self.contracts or position.get("mode") != "single":
@@ -291,6 +322,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 if not mark.is_finite() or mark <= 0:
                     raise ValueError("Cannot value an existing position")
                 position_quote[pair] = abs(converted[pair] * mark)
+                position_marks[pair] = mark
+                unrealised_pnl[pair] = Decimal(str(position["unrealised_pnl"]))
+                if not unrealised_pnl[pair].is_finite():
+                    raise ValueError("Invalid per-pair unrealized PnL")
             if epoch != self.account_epoch:
                 return
             if not self.config.dry_run:
@@ -302,11 +337,18 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     return
             self.positions = converted
             self.position_quote = position_quote
+            self.position_marks = position_marks
+            self.unrealised_pnl = unrealised_pnl
+            if not self.initialized:
+                # Ignore historical records already present before any bot orders.
+                self.initial_book_ids = set(cashflows)
+            self.cashflows = cashflows
             self.available = Decimal(str(account["available"]))
             self.equity = Decimal(str(account["total"])) + Decimal(str(account.get("unrealised_pnl", "0")))
             if not self.available.is_finite() or not self.equity.is_finite():
                 raise ValueError("Invalid account balances")
             self.exchange_open_pairs = {o["contract"].replace("_", "-") for o in open_orders}
+            self.exchange_open_ids = {o.get("text") for o in open_orders}
             self.account_at = self.current_timestamp
             self.account_dirty = False
             self.initialized = True
@@ -348,6 +390,50 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self._cancel_all()
             self.logger().warning(f"Account/market refresh failed; quoting paused: {exc}")
 
+    def _pair_pnl(self, pair):
+        """Gate cash settlements since selection + current mark-price PnL.
+
+        Fee/funding changes are signed USDT cashflows. Do not also add the
+        position's realised_pnl, which includes the same settlements.
+        """
+        selected_at = self.portfolio.slots[pair].selected_at
+        settled = sum((change for record_id, (p, timestamp, change) in self.cashflows.items()
+                       if p == pair and timestamp >= selected_at and record_id not in self.initial_book_ids), ZERO)
+        return settled + self.unrealised_pnl.get(pair, ZERO)
+
+    async def _account_book(self):
+        # Re-read this run's fixed time range rather than advancing a timestamp
+        # cursor: late fee/settlement records must not disappear between polls.
+        # IDs deduplicate records; offsets apply to a fixed 'to' on every page.
+        result = {}
+        start, end = int(self.run_started_at), int(self.current_timestamp)
+        for offset in range(0, 10000, 1000):
+            page = await self.connector._api_get(
+                path_url="futures/usdt/account_book", is_auth_required=True,
+                limit_id=C.USER_BALANCES_PATH_URL,
+                params={"from": start, "to": end, "limit": 1000, "offset": offset},
+            )
+            for record in page:
+                pair = record.get("contract", "").replace("_", "-")
+                kind = record["type"]
+                if kind in ("pnl", "fee", "fund") and not pair:
+                    raise ValueError("Cash settlement record has no contract; cannot attribute pair losses")
+                if pair not in self.contracts or kind not in ("pnl", "fee", "fund", "point_fee", "bonus_offset"):
+                    continue
+                change = Decimal(str(record["change"]))
+                timestamp = float(record["time"])
+                record_id = str(record["id"])
+                if not change.is_finite() or not math.isfinite(timestamp) or not record_id or record["id"] is None:
+                    raise ValueError("Invalid per-pair account-book record")
+                if kind in ("point_fee", "bonus_offset") and change != 0:
+                    raise ValueError("Per-pair loss accounting requires USDT fees; POINT/bonus charges are unsupported")
+                if record_id in result:
+                    raise RuntimeError("Account-book pages changed during pagination; retrying snapshot")
+                result[record_id] = (pair, timestamp, change)
+            if len(page) < 1000:
+                return result
+        raise ValueError("Account-book pagination limit reached; cannot monitor pair losses safely")
+
     async def _open_orders(self):
         # Gate paginates orders. Do not infer a flat/order-free account from only
         # the first page, even when this strategy normally has at most four orders.
@@ -373,10 +459,18 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 raise ValueError(f"Could not confirm 1x leverage for {pair}: {message}")
             self.connector._perpetual_trading.set_leverage(pair, 1)
 
-    def _exit_intent(self, pair, market, retiring_since):
+    def _exit_intent(self, pair, market, retiring_since, force_market=False):
         amount = self.positions.get(pair, ZERO)
         if amount == 0:
             return None
+        if force_market:
+            # A loss stop overrides allow_market_exit and the maker timeout.
+            # Use a fresh REST mark for budget valuation even if the candidate
+            # book/indicators have become stale or unsuitable for market making.
+            price = self.position_marks.get(pair, ZERO)
+            if not self._account_fresh() or price <= 0:
+                return None
+            return Intent(pair, amount < 0, abs(amount), price, close=True, market=True)
         if market is None or self.current_timestamp - market.observed_at > self.config.risk.max_age:
             return None
         buy = amount < 0
@@ -407,7 +501,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
     def _cancel_pair(self, pair):
         if self.config.dry_run:
             return
-        for order_id, order in list(self.orders.items()):
+        pending = dict(self.orders)
+        pending.update((oid, o) for oid, o in self.terminal_orders.items() if oid in self.exchange_open_ids)
+        for order_id, order in pending.items():
             if order.intent.pair != pair:
                 continue
             if order.cancel_at and self.current_timestamp - order.cancel_at < 5:
@@ -416,12 +512,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             order.cancel_at = self.current_timestamp
 
     def _cancel_all(self):
-        for pair in {o.intent.pair for o in self.orders.values()}:
+        pairs = {o.intent.pair for o in self.orders.values()}
+        pairs.update(o.intent.pair for oid, o in self.terminal_orders.items() if oid in self.exchange_open_ids)
+        for pair in pairs:
             self._cancel_pair(pair)
 
     def did_fill_order(self, event):
-        if event.order_id in self.orders:
-            order = self.orders[event.order_id]
+        order = self.orders.get(event.order_id) or self.terminal_orders.get(event.order_id)
+        if order is not None:
             order.remaining = max(ZERO, order.remaining - event.amount)
             pair = order.intent.pair
             change = event.amount if order.intent.buy else -event.amount
@@ -432,9 +530,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.next_quote[order.intent.pair] = 0
 
     def _terminal(self, event):
-        if self.orders.pop(event.order_id, None) is not None:
+        order = self.orders.pop(event.order_id, None)
+        if order is not None:
+            self.terminal_orders[event.order_id] = order
             self.account_epoch += 1
             self.account_dirty = True
+            if order.intent.pair in self.portfolio.excluded:
+                self.next_monitor = 0
 
     did_cancel_order = _terminal
     did_fail_order = _terminal
@@ -450,7 +552,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self._cancel_all()
         # Hummingbot stopping removes the strategy clock. Do not claim that a
         # cancellation request or a sent close order is a confirmed flat account.
-        if self.positions or self.orders or any(self.expected_positions.values()):
+        if self.positions or self.orders or self.exchange_open_pairs or any(self.expected_positions.values()):
             self.logger().warning("Strategy stopped with possible positions/orders; check Gate and reconcile before restarting")
 
     def format_status(self):
@@ -467,7 +569,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         reasons["no usable book/indicator snapshot"] = len(self.contracts) - len(snapshots)
         lines.append("Candidates: " + ", ".join(f"{reason}={count}" for reason, count in sorted(reasons.items()) if count))
         for pair, slot in self.portfolio.slots.items():
-            lines.append(f"{pair}: {slot.state}, position={self.positions.get(pair, ZERO)}, reason={slot.reason or '-'}")
+            lines.append(f"{pair}: {slot.state}, position={self.positions.get(pair, ZERO)}, "
+                         f"net_PnL={self._pair_pnl(pair)} USDT, reason={slot.reason or '-'}")
             for quote in self.last_quotes.get(pair, []):
                 lines.append(f"  {'buy' if quote.buy else 'sell'} {quote.amount} @ {quote.price}, close={quote.close}")
+        if self.portfolio.excluded:
+            lines.append("Loss-stopped pairs excluded this run: " + ", ".join(sorted(self.portfolio.excluded)))
         return "\n".join(lines)

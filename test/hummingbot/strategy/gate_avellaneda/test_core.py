@@ -29,6 +29,12 @@ class SettingsTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 Settings(**changes)
 
+    def test_pair_loss_limit_is_positive_and_finite(self):
+        self.assertEqual(Settings().pair_loss_limit, D("5"))
+        for value in (D("0"), D("-1"), D("NaN"), D("Infinity")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Settings(pair_loss_limit=value)
+
 
 class ScreeningTests(unittest.TestCase):
     def test_healthy_market(self):
@@ -129,6 +135,37 @@ class PortfolioTests(unittest.TestCase):
         self.portfolio.retire("A-USDT", "reserve", 100)
         self.portfolio.evaluate(self.markets, 100, True, {}, set(), allow_entries=False)
         self.assertEqual(set(self.portfolio.slots), {"B-USDT"})
+
+    def test_loss_boundary_latches_market_exit_without_confirmation_delay(self):
+        self.assertFalse(self.portfolio.stop_loss("A-USDT", D("-4.999"), 101))
+        self.assertTrue(self.portfolio.stop_loss("A-USDT", D("-5"), 102))
+        slot = self.portfolio.slots["A-USDT"]
+        self.assertEqual(slot.state, "retiring")
+        self.assertTrue(slot.force_market)
+        self.assertEqual(slot.failures, 0)
+        self.assertFalse(self.portfolio.stop_loss("A-USDT", D("1"), 103))
+        self.assertTrue(slot.force_market)
+
+    def test_loss_stop_preserves_slot_until_flat_and_excludes_after_cooldown(self):
+        self.portfolio.stop_loss("A-USDT", D("-7"), 101)
+        self.evaluate(102, positions={"A-USDT": D("1")})
+        self.assertNotIn("C-USDT", self.portfolio.slots)
+        self.evaluate(103, orders={"A-USDT"})
+        self.assertNotIn("C-USDT", self.portfolio.slots)
+        self.evaluate(104)
+        self.assertEqual(set(self.portfolio.slots), {"B-USDT", "C-USDT"})
+        self.portfolio.retire("C-USDT", "test", 900)
+        self.evaluate(901)
+        self.assertNotIn("A-USDT", self.portfolio.slots)
+        self.assertEqual(self.portfolio.slots["B-USDT"].selected_at, 100)
+
+    def test_loss_stop_upgrades_existing_maker_retirement(self):
+        self.portfolio.retire("A-USDT", "depth", 101)
+        self.assertTrue(self.portfolio.stop_loss("A-USDT", D("-5.1"), 110))
+        self.assertTrue(self.portfolio.slots["A-USDT"].force_market)
+        self.assertIn("loss limit", self.portfolio.slots["A-USDT"].reason)
+        self.assertFalse(self.portfolio.stop_loss("missing", D("-10"), 110))
+        self.assertFalse(self.portfolio.stop_loss("B-USDT", D("NaN"), 110))
 
 
 class QuoteTests(unittest.TestCase):
