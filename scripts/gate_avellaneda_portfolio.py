@@ -27,6 +27,10 @@ from hummingbot.strategy.__utils__.trailing_indicators.trading_intensity import 
 from hummingbot.strategy.gate_avellaneda.core import (
     Intent, Market, Portfolio, Settings, ZERO, allocate, avellaneda_quotes, candidate_universe,
 )
+from hummingbot.strategy.gate_avellaneda.adaptive import (
+    AdaptiveSettings, InventoryTracker, LossCircuit, ReturnHistory, entry_rejection,
+    exposure_bounds, exposure_scale, limit_exposure, quote_plan,
+)
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
 from hummingbot.strategy.gate_avellaneda.microstructure import GateMarketSignalFeed, MicroSettings
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -37,6 +41,7 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     dry_run: bool = True
     risk: Settings = Field(default_factory=Settings)
     micro: MicroSettings = Field(default_factory=MicroSettings)
+    adaptive: AdaptiveSettings = Field(default_factory=AdaptiveSettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -89,6 +94,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
     def __init__(self, connectors, config: GateAvellanedaPortfolioConfig):
         super().__init__(connectors, config)
         self.config = config
+        self.inventory = InventoryTracker(config.adaptive)
+        self.loss_circuit = LossCircuit(config.adaptive)
+        self.return_history = ReturnHistory(config.adaptive)
+        self.plans = {}
+        self.last_control_limits = {}
+        self.entry_allowed = True
+        self.selection_rejections = {}
         self.portfolio = Portfolio(config.risk)
         self.contracts = dict(self._initial_contracts)
         self.tickers = dict(self._initial_tickers)
@@ -161,6 +173,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         snapshots = self._snapshots()
         fresh = self._account_fresh()
         if not fresh:
+            if self.config.adaptive.enabled:
+                self.loss_circuit.allow_open(now, False, self.config.risk.max_age)
             # Once an account snapshot expires, outstanding orders are also
             # withdrawn. After a fill, wait for REST reconciliation before quoting.
             if now - self.account_at > self.config.risk.max_age:
@@ -170,14 +184,31 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if self.portfolio.stop_loss(pair, self._pair_pnl(pair), now):
                 self.logger().warning(self.portfolio.slots[pair].reason + f"; exiting {pair} at market")
                 self._cancel_pair(pair)
+                if self.config.adaptive.enabled:
+                    self.loss_circuit.record(pair, now)
                 # An already-flat loss exit can be replaced on this tick.
                 self.next_monitor = 0
+        if self.config.adaptive.enabled:
+            healthy = any(self._entry_check(m) is None for m in snapshots.values())
+            allowed = self.loss_circuit.allow_open(now, healthy, self.config.micro.max_age if self.config.micro.enabled
+                                                   else self.config.risk.max_age)
+            if allowed != self.entry_allowed:
+                self.next_monitor = 0
+            self.entry_allowed = allowed
+            if not allowed:
+                self._cancel_opening_orders()
+            for pair in self.portfolio.slots:
+                age = self.inventory.age(pair, self.positions.get(pair, ZERO), now)
+                if age >= self.config.adaptive.max_hold_seconds:
+                    self.portfolio.retire(pair, "maximum inventory holding time", now)
         self._micro_telemetry(now)
         if now >= self.next_monitor:
             before = {(p, s.state) for p, s in self.portfolio.slots.items()}
             self.portfolio.evaluate(snapshots, now, fresh, self.positions,
                                     self.exchange_open_pairs | {o.intent.pair for o in self.orders.values()},
-                                    allow_entries=self.equity > self.config.risk.reserve)
+                                    allow_entries=self.equity > self.config.risk.reserve and self.entry_allowed,
+                                    entry_check=self._entry_check if self.config.adaptive.enabled else None,
+                                    candidate_filter=self._candidate_filter if self.config.adaptive.enabled else None)
             after = {(p, s.state) for p, s in self.portfolio.slots.items()}
             if before != after:
                 self.logger().info(f"Portfolio slots: {sorted(after)}")
@@ -186,6 +217,18 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             for pair in self.portfolio.slots:
                 self.portfolio.retire(pair, "equity reached reserve floor", now)
         intents = []
+        signed_quote, pending_exposure, pair_caps = self._exposure_inputs(snapshots)
+        joint_breach = False
+        if self.config.adaptive.enabled:
+            longs, shorts = exposure_bounds(signed_quote, pending_exposure)
+            pairs = set(longs) | set(shorts)
+            joint_breach = (sum((max(longs.get(p, ZERO), shorts.get(p, ZERO)) for p in pairs), ZERO)
+                            > self.config.adaptive.max_gross_quote
+                            or max(sum(longs.values(), ZERO), sum(shorts.values(), ZERO))
+                            > self.config.adaptive.max_directional_quote
+                            or any(max(longs.get(p, ZERO), shorts.get(p, ZERO)) > pair_caps.get(p, ZERO) for p in pairs))
+            if joint_breach:
+                self._cancel_opening_orders()
         for pair, slot in list(self.portfolio.slots.items()):
             market = snapshots.get(pair)
             signal = self.signals.get(pair)
@@ -211,7 +254,37 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 if exit_intent:
                     intents.append(exit_intent)
                 continue
-            if market is None or market.rejection(self.config.risk, now):
+            if market is None:
+                self._cancel_pair(pair)
+                continue
+            if self.config.adaptive.enabled:
+                if market.close_rejection(self.config.risk, now):
+                    self._cancel_pair(pair)
+                    continue
+                plan = quote_plan(
+                    market, self.positions.get(pair, ZERO),
+                    self.inventory.age(pair, self.positions.get(pair, ZERO), now),
+                    self.config.risk, self.config.adaptive, now, signal if protecting else None,
+                    allow_open=self.entry_allowed and not joint_breach,
+                    blocked_side=self.inventory.blocked_side(pair, now),
+                )
+                self.plans[pair] = plan
+                opening = any(not q.close for q in plan.intents)
+                existing_close = any(o.intent.pair == pair and o.intent.close for o in self.orders.values())
+                if not opening:
+                    self._cancel_opening_orders(pair)
+                    if not existing_close:
+                        self.next_quote[pair] = 0
+                limits = self._control_limits(pair, plan)
+                previous_limits = self.last_control_limits.get(pair)
+                if previous_limits and (limits[0] < previous_limits[0] or limits[1] < previous_limits[1]
+                                        or limits[2] > previous_limits[2] or limits[3] < previous_limits[3]
+                                        or limits[4] > previous_limits[4] or limits[5] > previous_limits[5]
+                                        or (limits[6] is not None and limits[6] != previous_limits[6])):
+                    if opening:
+                        self._cancel_pair(pair)
+                        self.next_quote[pair] = 0
+            elif market.rejection(self.config.risk, now):
                 self._cancel_pair(pair)
                 continue
             if protecting and signal and signal.ready:
@@ -219,11 +292,16 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 stricter = (signal.buy_scale < previous[0] or signal.sell_scale < previous[1]
                             or (signal.paused and not previous[2]))
                 if stricter:
-                    self._cancel_pair(pair)
-                    self.next_quote[pair] = 0
+                    if self.config.adaptive.enabled and not opening:
+                        self._cancel_opening_orders(pair)
+                        if not existing_close:
+                            self.next_quote[pair] = 0
+                    else:
+                        self._cancel_pair(pair)
+                        self.next_quote[pair] = 0
                 previous_reference = self.quote_references.get(pair)
                 threshold = max(2 * market.tick, market.mid * self.config.micro.reprice_bps / Decimal(10000))
-                if (previous_reference is not None and abs(signal.reference - previous_reference) >= threshold
+                if (previous_reference is not None and abs((plan.reference if self.config.adaptive.enabled else signal.reference) - previous_reference) >= threshold
                         and now - self.last_submission.get(pair, 0) >= self.config.micro.min_reprice_seconds):
                     self.next_quote[pair] = 0
             if now < self.next_quote.get(pair, 0):
@@ -234,7 +312,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if pair in self.exchange_open_pairs:
                 self._cancel_pair(pair)
                 continue
-            quotes = avellaneda_quotes(
+            quotes = plan.intents if self.config.adaptive.enabled else avellaneda_quotes(
                 market, self.positions.get(pair, ZERO), self.config.risk,
                 reference_price=signal.reference if protecting else None,
                 buy_scale=signal.buy_scale if protecting else Decimal(1),
@@ -252,6 +330,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if not order.intent.close:
                 pair = order.intent.pair
                 outstanding[pair] = outstanding.get(pair, ZERO) + order.remaining * order.intent.price * Decimal("1.01")
+        if self.config.adaptive.enabled:
+            intents = limit_exposure(intents, signed_quote, pending_exposure, snapshots, pair_caps, self.config.adaptive)
         selected = allocate(intents, self.position_quote, outstanding, self.available, self.equity, self.config.risk)
         if self.config.dry_run:
             self.last_quotes = {p: [i for i in selected if i.pair == p] for p in self.portfolio.slots}
@@ -286,6 +366,16 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     vol.add_sample(mid)
                     intensity.calculate(self.current_timestamp)
                     self.history[pair].append(mid)
+                    if self.config.adaptive.enabled:
+                        if self.config.micro.enabled:
+                            observed = self.signal_feed.signal(pair, self.current_timestamp)
+                            if observed.ready:
+                                self.return_history.observe(pair, self.current_timestamp, (observed.bid + observed.ask) / 2)
+                        elif pair in self.books:
+                            raw, observed_at = self.books[pair]
+                            if self.current_timestamp - observed_at <= self.config.risk.max_age:
+                                price = (Decimal(str(raw["bids"][0]["p"])) + Decimal(str(raw["asks"][0]["p"]))) / 2
+                                self.return_history.observe(pair, self.current_timestamp, price)
             except (KeyError, ValueError, ArithmeticError):
                 continue
 
@@ -331,17 +421,67 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     multiplier * Decimal(str(contract["order_size_min"])), observed_at,
                     vol.is_sampling_buffer_full and intensity.is_sampling_buffer_full,
                     not contract.get("in_delisting", True),
+                    funding_interval=float(contract.get("funding_interval", 28800)),
+                    funding_next_at=float(contract.get("funding_next_apply", 0)),
                 )
             except (KeyError, IndexError, ValueError, ArithmeticError):
                 continue
         return snapshots
 
+    def _entry_check(self, market):
+        signal = self.signals.get(market.pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None
+        if signal is not None and signal.paused:
+            return "microstructure opening paused"
+        return entry_rejection(market, self.config.risk, self.config.adaptive, self.current_timestamp, signal)
+
+    def _candidate_filter(self, pair, selected):
+        eligible = self.return_history.eligible(pair, selected, self.current_timestamp)
+        if not eligible:
+            self.selection_rejections[pair] = "correlation unavailable or too high"
+        else:
+            self.selection_rejections.pop(pair, None)
+        return eligible
+
+    def _exposure_inputs(self, snapshots):
+        prices = {p: max(self.position_marks.get(p, ZERO), snapshots[p].mid if p in snapshots else ZERO)
+                  for p in self.contracts}
+        signed = {p: amount * prices[p] for p, amount in self.positions.items()}
+        owned = dict(self.orders)
+        owned.update((oid, o) for oid, o in self.terminal_orders.items() if oid in self.exchange_open_ids)
+        pending = [Intent(o.intent.pair, o.intent.buy, o.remaining, max(o.intent.price, prices[o.intent.pair]),
+                          o.intent.close, o.intent.market) for o in owned.values()]
+        caps = {}
+        for pair in self.contracts:
+            market = snapshots.get(pair)
+            valid = market and all(v.is_finite() for v in (market.mid, market.volatility, market.bid_depth, market.ask_depth))
+            scale = exposure_scale(market, self.config.risk, self.config.adaptive) if valid and market.mid > 0 else Decimal(1)
+            caps[pair] = self.config.risk.max_position_quote * scale
+        return signed, pending, caps
+
+    def _control_limits(self, pair, plan):
+        return (plan.position_cap, plan.order_quote, {"normal": 0, "caution": 1, "reduce_only": 2, "paused": 3}[plan.stage],
+                plan.confidence, plan.buy_premium, plan.sell_premium, self.inventory.blocked_side(pair, self.current_timestamp))
+
+    def _cancel_opening_orders(self, pair=None):
+        if self.config.dry_run:
+            return
+        pending = dict(self.orders)
+        pending.update((oid, o) for oid, o in self.terminal_orders.items() if oid in self.exchange_open_ids)
+        for order_id, order in pending.items():
+            if (order.intent.close or (pair is not None and order.intent.pair != pair)
+                    or (order.cancel_at and self.current_timestamp - order.cancel_at < 5)):
+                continue
+            self.cancel(self.connector_name, order.intent.pair, order_id)
+            order.cancel_at = self.current_timestamp
+
     def _remember_quote_signal(self, pair):
         signal = self.signals.get(pair)
         if self.config.micro.enabled and signal and signal.ready:
-            self.quote_references[pair] = signal.reference
+            self.quote_references[pair] = self.plans[pair].reference if self.config.adaptive.enabled and pair in self.plans else signal.reference
             self.last_submission[pair] = self.current_timestamp
             self.last_micro_limits[pair] = (signal.buy_scale, signal.sell_scale, signal.paused)
+        if self.config.adaptive.enabled and pair in self.plans:
+            self.last_control_limits[pair] = self._control_limits(pair, self.plans[pair])
 
     def _micro_telemetry(self, now):
         if not self.config.micro.enabled or now < self.next_signal_log:
@@ -406,6 +546,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self.logger().warning("REST positions disagree with confirmed fills; waiting for reconciliation")
                     return
             self.positions = converted
+            if self.config.adaptive.enabled:
+                self.inventory.reconcile(converted, self.current_timestamp)
             self.position_quote = position_quote
             self.position_marks = position_marks
             self.unrealised_pnl = unrealised_pnl
@@ -546,7 +688,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if not self._account_fresh() or price <= 0:
                 return None
             return Intent(pair, amount < 0, abs(amount), price, close=True, market=True)
-        if market is None or self.current_timestamp - market.observed_at > self.config.risk.max_age:
+        if market is None or market.close_rejection(self.config.risk, self.current_timestamp):
             return None
         buy = amount < 0
         price = market.bid if buy else market.ask
@@ -599,7 +741,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             order.remaining = max(ZERO, order.remaining - event.amount)
             pair = order.intent.pair
             change = event.amount if order.intent.buy else -event.amount
-            self.expected_positions[pair] = self.expected_positions.get(pair, ZERO) + change
+            before = self.expected_positions.get(pair, ZERO)
+            self.expected_positions[pair] = before + change
+            if self.config.adaptive.enabled:
+                timestamp = getattr(event, "timestamp", self.current_timestamp)
+                timestamp = min(timestamp, self.current_timestamp) if math.isfinite(timestamp) and timestamp >= 0 else self.current_timestamp
+                self.inventory.fill(pair, event.order_id, order.intent.buy, before, before + change,
+                                    order.intent.close, timestamp)
             self.account_epoch += 1
             self.account_dirty = True
             # Reprice both sides only after the new position is reconciled.
@@ -637,18 +785,30 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         lines = [f"Gate Avellaneda portfolio: {'DRY RUN (no orders)' if self.config.dry_run else 'LIVE'}",
                  f"Budget {self.config.risk.capital} USDT / reserve {self.config.risk.reserve}",
                  f"Subscribed candidates: {len(self.contracts)}; account fresh: {self._account_fresh()}"]
+        if self.config.adaptive.enabled:
+            lines.append(f"Adaptive controls: opening allowed={self.entry_allowed}, circuit_until={self.loss_circuit.until}, "
+                         f"gross cap={self.config.adaptive.max_gross_quote}, directional cap={self.config.adaptive.max_directional_quote}")
+            if self.selection_rejections:
+                lines.append("Selection checks: " + ", ".join(f"{p}={r}" for p, r in sorted(self.selection_rejections.items())))
         if self.halt_reason:
             lines.append(f"HALTED: {self.halt_reason}")
         if not self.portfolio.slots:
             lines.append("No qualifying pair yet; warming indicators or waiting for suitable markets")
         snapshots = self._snapshots()
-        reasons = Counter(m.rejection(self.config.risk, self.current_timestamp) or "eligible"
+        reasons = Counter((self._entry_check(m) if self.config.adaptive.enabled
+                           else m.rejection(self.config.risk, self.current_timestamp)) or "eligible"
                           for m in snapshots.values())
         reasons["no usable book/indicator snapshot"] = len(self.contracts) - len(snapshots)
         lines.append("Candidates: " + ", ".join(f"{reason}={count}" for reason, count in sorted(reasons.items()) if count))
         for pair, slot in self.portfolio.slots.items():
             lines.append(f"{pair}: {slot.state}, position={self.positions.get(pair, ZERO)}, "
                          f"net_PnL={self._pair_pnl(pair)} USDT, reason={slot.reason or '-'}")
+            plan = self.plans.get(pair)
+            if self.config.adaptive.enabled and plan:
+                lines.append(f"  inventory_stage={plan.stage}, age={self.inventory.age(pair, self.positions.get(pair, ZERO), self.current_timestamp):.1f}s, "
+                             f"position_cap={plan.position_cap}, order_quote={plan.order_quote}, signal_confidence={plan.confidence}, "
+                             f"effective_reference={plan.reference}, buy_premium={plan.buy_premium}, sell_premium={plan.sell_premium}, "
+                             f"entry_reason={plan.entry_reason or '-'}")
             signal = self.signals.get(pair)
             if self.config.micro.enabled and signal:
                 lines.append(f"  micro={self.config.micro.mode}, ready={signal.ready}, reference={signal.reference}, "
@@ -659,4 +819,3 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if self.portfolio.excluded:
             lines.append("Loss-stopped pairs excluded this run: " + ", ".join(sorted(self.portfolio.excluded)))
         return "\n".join(lines)
-

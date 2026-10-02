@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_CEILING, Decimal
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 D = Decimal
 ZERO = D("0")
@@ -74,12 +74,25 @@ class Market:
     observed_at: float
     ready: bool = True
     enabled: bool = True
+    funding_interval: float = 28800
+    funding_next_at: float = 0
 
     @property
     def mid(self) -> Decimal:
         return (self.bid + self.ask) / 2
 
-    def rejection(self, settings: Settings, now: float) -> Optional[str]:
+    def close_rejection(self, settings: Settings, now: float) -> Optional[str]:
+        """Execution safety for reducing exposure, independent of entry economics."""
+        if any(not x.is_finite() for x in (self.bid, self.ask, self.step, self.tick, self.minimum)):
+            return "invalid executable market values"
+        if (not math.isfinite(now) or not math.isfinite(self.observed_at) or now - self.observed_at > settings.max_age
+                or self.observed_at > now):
+            return "stale market data"
+        if min(self.bid, self.step, self.tick, self.minimum) <= 0 or self.ask <= self.bid:
+            return "invalid trading rules or book"
+        return None
+
+    def rejection(self, settings: Settings, now: float, quoted_economics: bool = False) -> Optional[str]:
         values = [v for v in vars(self).values() if isinstance(v, D)]
         if any(not v.is_finite() for v in values):
             return "invalid market values"
@@ -97,14 +110,15 @@ class Market:
             return "order cannot meet minimum after rounding"
         spread = (self.ask - self.bid) / self.mid
         cost = 2 * max(ZERO, self.maker_fee) + settings.min_net_spread
-        if spread < cost:
+        if not quoted_economics and spread < cost:
             return "book spread below fee and edge threshold"
         if spread > settings.max_book_spread:
             return "book spread too wide"
-        model_spread = settings.gamma * self.volatility
-        model_spread += 2 * (1 + settings.gamma / self.kappa).ln() / settings.gamma
-        if model_spread / self.mid > settings.max_quote_spread:
-            return "model spread too wide"
+        if not quoted_economics:
+            model_spread = settings.gamma * self.volatility
+            model_spread += 2 * (1 + settings.gamma / self.kappa).ln() / settings.gamma
+            if model_spread / self.mid > settings.max_quote_spread:
+                return "model spread too wide"
         if self.tick / self.mid > settings.max_book_spread / 2:
             return "price tick too coarse"
         if self.volatility / self.mid > settings.max_volatility:
@@ -146,9 +160,11 @@ class Portfolio:
         self.excluded: Set[str] = set()
 
     def evaluate(self, markets: Dict[str, Market], now: float, account_fresh: bool,
-                 positions: Dict[str, Decimal], open_pairs: Set[str], allow_entries: bool = True) -> None:
+                 positions: Dict[str, Decimal], open_pairs: Set[str], allow_entries: bool = True,
+                 entry_check: Optional[Callable] = None, candidate_filter: Optional[Callable] = None) -> None:
         if not account_fresh:
             return
+        reject = entry_check or (lambda market: market.rejection(self.settings, now))
         for pair, slot in list(self.slots.items()):
             if slot.state == "retiring":
                 if positions.get(pair, ZERO) == 0 and pair not in open_pairs:
@@ -156,7 +172,7 @@ class Portfolio:
                     self.cooldowns[pair] = now + self.settings.cooldown
                 continue
             market = markets.get(pair)
-            reason = market.rejection(self.settings, now) if market else "stale market data"
+            reason = reject(market) if market else "stale market data"
             # Data loss is a pause, not evidence that a coin's economics changed.
             if reason in ("stale market data", "invalid market values", "indicators warming up"):
                 continue
@@ -168,10 +184,14 @@ class Portfolio:
             return
         candidates = sorted(
             (m for m in markets.values() if m.pair not in self.slots and m.pair not in self.excluded
-             and now >= self.cooldowns.get(m.pair, 0) and m.rejection(self.settings, now) is None),
+             and now >= self.cooldowns.get(m.pair, 0) and reject(m) is None),
             key=lambda m: (-m.score(), m.pair),
         )
-        for market in candidates[:max(0, 2 - len(self.slots))]:
+        for market in candidates:
+            if len(self.slots) >= 2:
+                break
+            if candidate_filter and not candidate_filter(market.pair, tuple(self.slots)):
+                continue
             self.slots[market.pair] = Slot(market.pair, selected_at=now)
 
     def retire(self, pair: str, reason: str, now: float) -> None:
@@ -310,4 +330,3 @@ def candidate_universe(contracts: List[dict], tickers: List[dict], settings: Set
             continue
     candidates.sort(key=lambda item: (-item[0], item[1]))
     return {pair: contract for _, pair, contract in candidates[:limit]}
-

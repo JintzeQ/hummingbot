@@ -81,6 +81,8 @@ class MicroSignal:
     paused: bool = False
     pause_age: float = 0
     retire: bool = False
+    flow_sufficient: bool = False
+    book_flow_conflict: bool = False
 
 
 class BookState:
@@ -352,4 +354,5 @@ class GateMarketSignalFeed:
         return MicroSignal(True, reason, state.event_at, bid, ask, bid_depth, ask_depth, weighted_mid,
                            reference, imbalance, flow, flow_quote, bid_loss, ask_loss,
                            buy_scale, sell_scale, paused, pause_age,
-                           paused and state.clear_since is None and pause_age >= settings.retire_seconds)
+                           paused and state.clear_since is None and pause_age >= settings.retire_seconds,
+                           flow_sufficient=enough_flow, book_flow_conflict=bid_conflict or ask_conflict)

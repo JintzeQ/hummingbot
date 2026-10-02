@@ -195,6 +195,21 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(signal.sell_scale, 1)
         self.assertFalse(signal.paused)
 
+    def test_confidence_flags_follow_configured_thresholds(self):
+        self.feed.settings = replace(self.settings, imbalance_threshold=D("0.8"), min_flow_quote=D("150"))
+        self.warm(500000, 100000)
+        self.trade(102)
+        self.update(102)
+        signal = self.feed.signal(PAIR, 102)
+        self.assertFalse(signal.flow_sufficient)
+        self.assertFalse(signal.book_flow_conflict)
+        self.feed.settings = replace(self.feed.settings, min_flow_quote=D("25"))
+        signal = self.feed.signal(PAIR, 102)
+        self.assertTrue(signal.flow_sufficient)
+        self.assertFalse(signal.book_flow_conflict)
+        self.feed.settings = replace(self.feed.settings, imbalance_threshold=D("0.6"))
+        self.assertTrue(self.feed.signal(PAIR, 102).book_flow_conflict)
+
     def test_ask_conflict_and_buy_pressure_scale_sell(self):
         for bid, ask in [(100000, 500000), (500000, 100000)]:
             self.feed.reset()

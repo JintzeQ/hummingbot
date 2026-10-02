@@ -33,6 +33,35 @@ micro:
   caution_scale: '0.5'
   reprice_bps: '2'
   min_reprice_seconds: 2
+adaptive:
+  enabled: true
+  inventory_strength: '1' # inventory center adjustment, independent of quote width
+  inventory_power: '2'
+  soft_ratio: '0.5'
+  reduce_only_ratio: '0.75'
+  age_ramp_seconds: 120
+  max_hold_seconds: 600
+  same_side_fill_limit: 3 # distinct opening orders; partial fills count once
+  same_side_cooldown_seconds: 15
+  volatility_reference: '0.001'
+  min_size_scale: '0.25'
+  depth_target_multiple: '20'
+  spread_multiplier: '1'
+  unconfirmed_confidence: '0.5'
+  micro_risk_bps: '2'
+  carry_horizon_seconds: 120
+  min_arrival_attenuation: '0.01' # relative sampled-volume decay, NOT fill probability
+  max_gross_quote: '40' # worst-case positions plus pending opening orders
+  max_directional_quote: '25'
+  correlation_sample_seconds: 5
+  correlation_history_samples: 121
+  correlation_min_samples: 30
+  max_abs_correlation: '0.85'
+  require_correlation: true # second slot waits for enough fresh aligned returns
+  stop_window_seconds: 900
+  stop_count: 2
+  stop_pause_seconds: 600
+  recovery_seconds: 30
 risk:
   capital: '100'
   reserve: '20'
@@ -41,8 +70,8 @@ risk:
   order_quote: '5'
   pair_loss_limit: '5'
   leverage: 1
-  gamma: '1'
-  eta: '1'
+  gamma: '1' # legacy pricing when adaptive.enabled is false
+  eta: '1' # legacy opening size adjustment
   min_net_spread: '0.0002'
   max_book_spread: '0.005'
   max_quote_spread: '0.02'
@@ -54,4 +83,3 @@ risk:
   max_age: 15
   failures_to_retire: 3
   cooldown: 600
-

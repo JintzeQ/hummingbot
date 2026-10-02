@@ -18,6 +18,7 @@ class MicroAdapterTests(unittest.IsolatedAsyncioTestCase):
             t["contract"].replace("_", "-"): t for t in self.connector.tickers
         }
         self.config = adapter.GateAvellanedaPortfolioConfig(
+            adaptive=dict(enabled=False),
             micro=MicroSettings(warmup_seconds=1, min_samples=3, confirm_seconds=1, recover_seconds=2, retire_seconds=5),
         )
         self.bot = adapter.GateAvellanedaPortfolio({"gate_io_perpetual": self.connector}, self.config)
