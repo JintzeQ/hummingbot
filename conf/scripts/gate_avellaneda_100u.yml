@@ -11,6 +11,22 @@ quote_refresh_seconds: 15
 exit_timeout_seconds: 60
 allow_market_exit: true
 maker_fee_floor: '0.0002'
+account_risk:
+  enabled: true
+  persist: true # mandatory for live account risk; dry-run has a separate file
+  state_path: data/gate_avellaneda_risk_state.json
+  session_loss_limit: '10'
+  daily_loss_limit: '10'
+  max_drawdown: '10'
+  reconciliation_tolerance: '0.01'
+  timezone: Asia/Taipei
+telemetry:
+  enabled: true
+  path: logs/gate_avellaneda_quality.jsonl
+  sample_seconds: 1
+  markout_wait_seconds: 2
+  max_bytes: 20000000
+  backups: 5
 micro:
   enabled: true
   mode: protect # observe logs without changing reference, sizes or retirement

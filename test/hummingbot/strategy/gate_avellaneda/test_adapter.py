@@ -24,7 +24,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             for p in pairs
         }
         self.connector = FakeConnector(pairs)
-        self.config = adapter.GateAvellanedaPortfolioConfig(micro=dict(enabled=False), adaptive=dict(enabled=False))
+        self.config = adapter.GateAvellanedaPortfolioConfig(account_risk=dict(enabled=False), telemetry=dict(enabled=False), micro=dict(enabled=False), adaptive=dict(enabled=False))
         self.bot = adapter.GateAvellanedaPortfolio({"gate_io_perpetual": self.connector}, self.config)
 
     async def ready(self, live=False):
