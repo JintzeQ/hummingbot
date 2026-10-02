@@ -1,0 +1,33 @@
+# Observation only. No orders, mode changes or leverage changes are submitted.
+script_file_name: gate_avellaneda_portfolio.py
+dry_run: true
+candidate_limit: 20
+candidate_pairs: []
+sample_ticks: 60
+account_refresh_seconds: 3
+book_refresh_seconds: 10
+monitor_seconds: 60
+quote_refresh_seconds: 15
+exit_timeout_seconds: 60
+allow_market_exit: true
+maker_fee_floor: '0.0002'
+risk:
+  capital: '100'
+  reserve: '20'
+  pair_margin: '40'
+  max_position_quote: '20'
+  order_quote: '5'
+  leverage: 1
+  gamma: '1'
+  eta: '1'
+  min_net_spread: '0.0002'
+  max_book_spread: '0.005'
+  max_quote_spread: '0.02'
+  max_volatility: '0.005'
+  max_trend: '0.03'
+  max_funding: '0.002'
+  min_volume: '1000000'
+  min_depth: '50'
+  max_age: 15
+  failures_to_retire: 3
+  cooldown: 600

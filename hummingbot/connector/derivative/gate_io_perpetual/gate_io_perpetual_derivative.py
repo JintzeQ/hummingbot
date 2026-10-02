@@ -21,7 +21,7 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
@@ -272,7 +272,7 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
 
                 min_amount_inc = Decimal(f"{rule['quanto_multiplier']}")
                 min_price_inc = Decimal(f"{rule['order_price_round']}")
-                min_amount = min_amount_inc
+                min_amount = min_amount_inc * Decimal(str(rule.get("order_size_min", 1)))
                 min_notional = Decimal(str(1))
                 result[trading_pair] = TradingRule(trading_pair,
                                                    min_order_size=min_amount,
@@ -300,6 +300,10 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             "contract": symbol,
             "size": float(-size) if trade_type.name.lower() == 'sell' else float(size),
         }
+        # CLOSE must not open a reverse position if another close fills first.
+        # The perpetual base forwards PositionAction through kwargs.
+        if kwargs.get("position_action") == PositionAction.CLOSE:
+            data["reduce_only"] = True
         if order_type.is_limit_type():
             data.update({
                 "price": f"{price:f}",
