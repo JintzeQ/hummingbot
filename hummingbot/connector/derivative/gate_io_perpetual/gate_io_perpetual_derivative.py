@@ -316,6 +316,13 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().error(f"Error parsing the trading pair rule {rule}. Skipping.", exc_info=True)
         return list(result.values())
 
+    def _allow_small_reduce_only_order(self, order, **kwargs) -> bool:
+        # Gate expresses its minimum in contract lots. The connector's generic
+        # 1-USDT entry floor must not strand a valid integer-lot reducing tail.
+        # _create_order still validates the contract minimum/step, and
+        # _place_order always transmits reduce_only for this exact action.
+        return kwargs.get("position_action") == PositionAction.CLOSE
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -326,10 +333,12 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                            **kwargs) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         size = self._format_amount_to_size(trading_pair, amount)
+        if not size.is_finite() or size <= 0 or size != size.to_integral_value():
+            raise ValueError("Gate order size must be a positive integer number of contracts")
         data = {
             "text": order_id,
             "contract": symbol,
-            "size": float(-size) if trade_type.name.lower() == 'sell' else float(size),
+            "size": int(-size) if trade_type.name.lower() == 'sell' else int(size),
         }
         # CLOSE must not open a reverse position if another close fills first.
         # The perpetual base forwards PositionAction through kwargs.
@@ -358,8 +367,9 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             is_auth_required=True,
             limit_id=endpoint,
         )
-        if order_result.get('finish_as') in {"cancelled", "expired", "failed", "ioc"}:
-            raise IOError({"label": "ORDER_REJECTED", "message": "Order rejected."})
+        # A successful response with an exchange ID may already be partially
+        # filled and IOC-canceled. Retain its identity for fill/status polling;
+        # an IOC terminal reason is not an API rejection or a zero-fill proof.
         exchange_order_id = str(order_result["id"])
         return exchange_order_id, self.current_timestamp
 

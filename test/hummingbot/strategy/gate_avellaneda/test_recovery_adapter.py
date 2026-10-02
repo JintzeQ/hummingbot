@@ -121,7 +121,7 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_contracts = {p: contract(p) for p in self.pairs}
         self.connector = RecoveryConnector(self.pairs)
         adapter.GateAvellanedaPortfolio._initial_tickers = {t["contract"].replace("_", "-"): t for t in self.connector.tickers}
-        self.config = adapter.GateAvellanedaPortfolioConfig(
+        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
             dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False),
             account_risk=dict(state_path=self.directory.name + "/risk.json"),
             telemetry=dict(path=self.directory.name + "/quality.jsonl"))
@@ -406,6 +406,13 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.refresh(111)
         await self.refresh(112)
         self.assertEqual(self.bot.expected_positions["A-USDT"], D("0.5"))
+        self.assertNotIn(cid, self.bot.orders)
+        self.assertNotIn(cid, self.bot.recovery.orders)
+        self.bot.portfolio.stop_loss("A-USDT", D(-5), 112)
+        self.bot.on_tick()
+        closes = [row for row in self.connector.sent if row[2] == "A-USDT" and row[5]["position_action"] == PositionAction.CLOSE]
+        self.assertEqual(len(closes), 1)
+        self.assertEqual(closes[0][4], OrderType.MARKET)
 
     async def test_confirmed_terminal_pruned_only_after_fill_and_position_agreement(self):
         await self.ready()
@@ -473,7 +480,8 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.refresh(at)
         self.assertTrue(self.bot.recovery.recovering)
         self.assertIn("mismatch", self.bot.recovery.reason)
-        self.assertFalse(self.bot._recovery_verified)
+        self.assertTrue(self.bot._recovery_verified)
+        self.assertFalse(self.bot._opening_ready())
 
     async def test_new_slots_remain_owned_until_terminal_settlement_is_proven(self):
         await self.ready()
@@ -592,7 +600,25 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_recovery_requires_persistent_risk(self):
         for account_risk in (dict(enabled=False), dict(persist=False)):
             with self.assertRaisesRegex(ValueError, "persistent"):
-                adapter.GateAvellanedaPortfolioConfig(account_risk=account_risk)
+                adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=account_risk)
+
+
+    async def test_cash_ownership_write_retry_does_not_leave_live_terminal_ghost(self):
+        await self.ready()
+        cid = self.send()
+        self.connector.fill(cid,500,'opening',timestamp=110)
+        self.bot.current_timestamp = 110
+        self.bot.did_fill_order(types.SimpleNamespace(order_id=cid,amount=D('.5'),price=D(10),timestamp=110))
+        with patch.object(self.bot.cash_journal,'own_trade',side_effect=OSError('ownership disk error')):
+            await self.refresh(111)
+            await self.refresh(112)
+            self.assertNotIn(cid,self.bot.orders)
+            self.assertIn(cid,self.bot.recovery.orders)
+            self.assertFalse(self.bot._opening_ready())
+        await self.refresh(113)
+        self.assertNotIn(cid,self.bot.recovery.orders)
+        rows=self.bot.cash_journal.db.execute('SELECT start FROM owners WHERE pair=? AND trade_id=?',('A-USDT','opening')).fetchall()
+        self.assertEqual(rows,[(100,)])
 
 
 class GateReservedOrderProductionTests(unittest.IsolatedAsyncioTestCase):

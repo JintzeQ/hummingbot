@@ -174,7 +174,7 @@ class AccountRisk:
             raise ValueError("POINT/bonus cash history requires manual USDT reconciliation")
         return user
 
-    def observe(self, account, records, position_upnl, now, reserve):
+    def observe(self, account, records, position_upnl, now, reserve, cash_totals=None):
         if not self.settings.enabled:
             return
         user = self.validate_account(account)
@@ -192,6 +192,8 @@ class AccountRisk:
         self.cash_totals = {kind: sum((finite(r["change"]) for rid, r in records.items()
                                       if rid not in initial_ids and r["kind"] == kind), ZERO)
                             for kind in CASH_TYPES}
+        if cash_totals is not None:
+            self.cash_totals = {kind: finite(cash_totals[kind]) for kind in CASH_TYPES}
         # History provides a second source for late/missing account-book rows.
         deltas = {k: history[k] - finite(self.anchor["history"][k]) for k in CASH_TYPES}
         ledger_settled = sum((self.cash_totals[k] for k in TRADING_TYPES), ZERO)

@@ -22,7 +22,7 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.connector.account = account()
         adapter.GateAvellanedaPortfolio._initial_tickers = {
             t["contract"].replace("_", "-"): t for t in self.connector.tickers}
-        self.config = adapter.GateAvellanedaPortfolioConfig(
+        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
             dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False), recovery=dict(enabled=False),
             account_risk=dict(state_path=self.directory.name + "/risk.json"),
             telemetry=dict(path=self.directory.name + "/quality.jsonl"))
@@ -242,7 +242,8 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.bot.current_timestamp = 102
         rows = await self.bot._account_book()
         self.assertEqual(len(rows), 0)
-        self.assertEqual(set(rows.records), {"1", "2"})
+        self.assertEqual(rows.cash_totals["fee"], D("-1"))
+        self.assertEqual(rows.cash_totals["dnw"], D("50"))
         self.connector.account_book.append(self.book(2, "dnw", "50", ""))
         with self.assertRaises(RuntimeError):
             await self.bot._account_book()
@@ -285,4 +286,124 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_live_persistence_cannot_be_disabled_while_account_guard_enabled(self):
         with self.assertRaisesRegex(ValueError, "persistent"):
-            adapter.GateAvellanedaPortfolioConfig(dry_run=False, account_risk=dict(persist=False))
+            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), dry_run=False, account_risk=dict(persist=False))
+
+    async def test_latched_market_close_survives_cash_endpoint_outage(self):
+        await self.ready()
+        await self.positions({'A-USDT':D('.05')}, {'A-USDT':-5})
+        self.bot.portfolio.stop_loss('A-USDT', D(-5), 101)
+        original = self.connector._api_get
+
+        async def failed_book(path_url, **kwargs):
+            if path_url == 'futures/usdt/account_book':
+                raise OSError('cash endpoint timeout')
+            return await original(path_url, **kwargs)
+
+        self.connector._api_get = failed_book
+        self.bot.current_timestamp = 102
+        await self.bot._refresh()
+        self.assertTrue(self.bot.cash_error)
+        self.assertTrue(self.bot._account_fresh())
+        self.assertFalse(self.bot._opening_ready())
+        self.bot.on_tick()
+        self.assertEqual(len(self.connector.sent), 1)
+        self.assertEqual(self.connector.sent[0][3], D('.05'))
+        self.assertEqual(self.connector.sent[0][4], OrderType.MARKET)
+        self.assertEqual(self.connector.sent[0][5]['position_action'], PositionAction.CLOSE)
+
+    async def test_production_cash_pagination_resumes_after_ten_thousand(self):
+        await self.ready()
+        self.connector.account_book = [self.book(i, 'fee', '-0.000001') for i in range(10001)]
+        self.connector.account = account(fee='-0.010001')
+        self.bot.current_timestamp = 102
+        await self.bot._refresh()
+        self.assertTrue(self.bot.cash_error)
+        self.assertFalse(self.bot.halt_reason)
+        self.assertTrue(self.bot._account_fresh())
+        self.assertEqual(self.bot.cash_journal.page_range(102)[2], 10000)
+        await self.bot._refresh()
+        self.assertFalse(self.bot.cash_error)
+        self.assertFalse(self.bot.account_risk.reconciliation_error)
+        self.assertEqual(self.bot.account_risk.cash_totals['fee'], D('-0.010001'))
+        self.assertTrue(self.bot._opening_ready())
+
+    async def test_released_pair_late_fee_exclusion_and_loss_circuit_persist(self):
+        await self.ready()
+        self.bot._checkpoint()
+        self.connector.account_book = [self.book(1, 'pnl', '-4.999')]
+        self.connector.account = account(pnl='-4.999')
+        self.bot.current_timestamp = 102
+        await self.bot._refresh()
+        self.bot.portfolio.retire('A-USDT', 'test completed lifecycle', 102)
+        self.bot.next_monitor = 0
+        self.bot.on_tick()
+        self.assertNotIn('A-USDT', self.bot.portfolio.slots)
+        self.assertNotIn('A-USDT', self.bot.portfolio.excluded)
+        self.assertEqual(self.bot.cash_journal.closed_cycles()[0][:2], ('A-USDT', 100))
+        self.connector.account_book.append(self.book(2, 'fee', '-0.002', at=103))
+        self.connector.account = account(pnl='-4.999', fee='-0.002')
+        self.bot.current_timestamp = 104
+        await self.bot._refresh()
+        self.assertIn('A-USDT', self.bot.portfolio.excluded)
+        self.assertIn('A-USDT', self.bot.loss_circuit.seen)
+        self.assertEqual(self.bot.account_risk.pnl, D('-5.001'))
+        self.bot._checkpoint()
+        await self.bot.on_stop()
+        self.bot = self.new_bot()
+        self.assertIn('A-USDT', self.bot.portfolio.excluded)
+        self.assertIn('A-USDT', self.bot.loss_circuit.seen)
+
+    async def test_cash_disk_error_does_not_invalidate_confirmed_position_exit(self):
+        await self.ready()
+        await self.positions({'A-USDT':D('.05')}, {'A-USDT':-5})
+        self.bot.portfolio.stop_loss('A-USDT', D(-5), 101)
+        with patch.object(self.bot.cash_journal, 'ingest', side_effect=OSError('disk full')):
+            self.bot.current_timestamp = 102
+            await self.bot._refresh()
+            self.bot.on_tick()
+        self.assertTrue(self.bot.cash_error)
+        self.assertTrue(self.bot._account_fresh())
+        self.assertTrue(all(row[5]['position_action'] == PositionAction.CLOSE for row in self.connector.sent))
+        self.assertEqual(len(self.connector.sent), 1)
+
+    async def test_periodic_rescan_finds_old_small_late_fee_below_tolerance(self):
+        await self.ready()
+        self.bot._checkpoint()
+        self.bot.current_timestamp = 1000
+        await self.bot._refresh()
+        self.connector.account_book = [self.book(1, 'fee', '-0.002', at=101)]
+        self.connector.account = account(fee='-0.002')
+        self.bot.current_timestamp = 1003
+        await self.bot._refresh()
+        self.assertEqual(self.bot.cash_journal.snapshot().cash_totals['fee'], 0)
+        self.assertFalse(self.bot.account_risk.reconciliation_error)
+        self.bot.current_timestamp = 3701
+        await self.bot._refresh()
+        self.assertEqual(self.bot.cash_journal.snapshot().cash_totals['fee'], D('-0.002'))
+
+    async def test_closed_cycle_database_failure_keeps_safe_exit_available(self):
+        await self.ready()
+        await self.positions({'A-USDT':D('.05')}, {'A-USDT':-5})
+        self.bot.portfolio.stop_loss('A-USDT',D(-5),101)
+        with patch.object(self.bot.cash_journal, 'closed_cycles', side_effect=OSError('read failure')):
+            self.bot.current_timestamp = 102
+            await self.bot._refresh()
+            self.assertTrue(self.bot._account_fresh())
+            self.assertTrue(self.bot.cash_error)
+            self.bot.on_tick()
+        self.assertEqual(len(self.connector.sent),1)
+        self.assertEqual(self.connector.sent[0][5]['position_action'],PositionAction.CLOSE)
+
+    async def test_rescan_metadata_failure_still_allows_latched_close(self):
+        await self.ready()
+        await self.positions({'A-USDT':D('.05')}, {'A-USDT':-5})
+        self.bot.portfolio.stop_loss('A-USDT',D(-5),101)
+        self.connector.account = account(fee='-1',upnl='-5')
+        with patch.object(self.bot.cash_journal, 'request_rescan', side_effect=OSError('metadata failure')):
+            self.bot.current_timestamp = 102
+            await self.bot._refresh()
+            self.assertTrue(self.bot._account_fresh())
+            self.assertFalse(self.bot._opening_ready())
+            self.bot.on_tick()
+        self.assertEqual(len(self.connector.sent),1)
+        self.assertEqual(self.connector.sent[0][5]['position_action'],PositionAction.CLOSE)

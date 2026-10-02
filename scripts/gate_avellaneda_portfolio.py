@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from decimal import Decimal
@@ -40,6 +41,9 @@ from hummingbot.strategy.gate_avellaneda.account_risk import (
 )
 from hummingbot.strategy.gate_avellaneda.verification import QualityRecorder, TelemetrySettings, plain
 from hummingbot.strategy.gate_avellaneda.recovery import RecoveryLedger, RecoverySettings, intent_from_json, recovery_pairs
+from hummingbot.strategy.gate_avellaneda.cash_journal import CashJournal
+from hummingbot.strategy.gate_avellaneda.execution import DeadmanSettings, ExecutionSettings
+from hummingbot.strategy.gate_avellaneda.quality_control import QualityControl, QualitySettings
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
 from hummingbot.strategy.gate_avellaneda.microstructure import GateMarketSignalFeed, MicroSettings
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -55,6 +59,9 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     account_risk: AccountRiskSettings = Field(default_factory=AccountRiskSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     recovery: RecoverySettings = Field(default_factory=RecoverySettings)
+    deadman: DeadmanSettings = Field(default_factory=DeadmanSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    quality_control: QualitySettings = Field(default_factory=QualitySettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -68,6 +75,8 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
 
     @model_validator(mode="after")
     def validate_refresh_age(self):
+        if self.quality_control.enabled and (not self.adaptive.enabled or not self.telemetry.enabled):
+            raise ValueError("Execution quality requires adaptive pricing and observed-fill telemetry")
         if self.recovery.enabled and (not self.account_risk.enabled or not self.account_risk.persist):
             raise ValueError("Recovery requires persistent account risk")
         if not self.dry_run and self.account_risk.enabled and not self.account_risk.persist:
@@ -136,6 +145,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.last_gamma_values = {}
         self.plans = {}
         self.last_control_limits = {}
+        self.last_quality_limits = {}
         self.entry_allowed = True
         self.selection_rejections = {}
         self.portfolio = Portfolio(config.risk)
@@ -161,6 +171,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.position_marks = {}
         self.unrealised_pnl = {}
         self.cashflows = {}
+        self.cash_journal = None
+        self.cash_error = ""
         self.initial_book_ids = set()
         self.run_started_at = None
         # Live starts flat. Track signed fills independently of potentially
@@ -183,7 +195,12 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.last_quotes = {}
         self.stopping = False
         self.account_risk = AccountRisk(config.account_risk)
-        self.recorder = QualityRecorder(config.telemetry, config.dry_run)
+        self.quality = QualityControl(config.quality_control)
+        self.recorder = QualityRecorder(config.telemetry, config.dry_run, on_markout=self.quality.observe)
+        self.heartbeat_task = None
+        self.heartbeat_deadlines = {}
+        self.next_heartbeat = 0
+        self.heartbeat_error = ""
         self.recovery = RecoveryLedger(config.recovery)
         self._replaying_fills = False
         self._recovery_pending_settlements = set()
@@ -222,13 +239,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 and self.current_timestamp - self.account_at <= self.config.risk.max_age)
 
     def _opening_ready(self):
-        return (self.account_risk.allow_open and not self.persistence_error and not self.recorder.error
+        return (self.account_risk.allow_open and not self.persistence_error and not self.recorder.error and not self.cash_error
                 and not self.recovery.recovering and not self._recovery_block_open)
 
     def _restore_checkpoint(self, payload):
         if payload["dry_run"] is not self.config.dry_run or payload["scope"] != "gate_io_perpetual/usdt/classic":
             raise ValueError("Persistent risk scope/mode mismatch")
         self.account_risk.restore(payload["account"])
+        self.quality.restore(payload.get("quality", []))
         self.run_started_at = finite_time(payload["run_started_at"])
         if self.account_risk.anchor is None:
             raise ValueError("Persistent state has no account baseline")
@@ -290,17 +308,26 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                        excluded=sorted(self.portfolio.excluded), cooldowns=self.portfolio.cooldowns.copy(),
                        circuit=dict(events=list(self.loss_circuit.events), seen=sorted(self.loss_circuit.seen),
                                     until=self.loss_circuit.until))
+        payload["quality"] = self.quality.dump(self.current_timestamp)
         if self.config.recovery.enabled:
             payload["recovery"] = self.recovery.dump(self.expected_positions, self.portfolio, self.inventory)
             payload["recovery"]["gamma_states"] = {p: plain(asdict(state)) for p, state in self.gamma.states.items()
                                                    if p in self.portfolio.slots}
         try:
+            if self.cash_journal is not None:
+                for slot in self.portfolio.slots.values():
+                    self.cash_journal.begin_cycle(slot.pair, slot.selected_at)
+                for row in self.recovery.orders.values():
+                    slot = self.portfolio.slots.get(row["intent"]["pair"])
+                    if slot is not None:
+                        for trade_id in row["fills"]:
+                            self.cash_journal.own_trade(slot.pair, trade_id, slot.selected_at)
             if payload != self._saved_payload or self.persistence_error:
                 self.risk_store.save(payload)
                 self._saved_payload = payload
             self.persistence_error = ""
             return True
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.persistence_error = f"risk checkpoint failed: {exc}"
             self._cancel_opening_orders()
             self.logger().error(self.persistence_error)
@@ -333,6 +360,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.recorder.sample(now, {}, 0)
             self._cancel_all()
             return
+        self._heartbeat_tick(now)
         self._sample()
         snapshots = self._snapshots()
         self.last_markets = snapshots
@@ -375,6 +403,12 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 self._cancel_opening_orders()
             for pair in self.portfolio.slots:
                 age = self.inventory.age(pair, self.positions.get(pair, ZERO), now)
+                market = snapshots.get(pair)
+                evidence = self._quality_snapshot(market).get(str(self.positions.get(pair, ZERO) > 0), {}) if market else {}
+                if (age >= self.config.quality_control.soft_exit_age_seconds and self._pair_pnl(pair) < 0
+                        and evidence.get("ready") and evidence.get("block")):
+                    self.portfolio.retire(pair, "persistent adverse execution quality with losing inventory", now)
+                    self._cancel_opening_orders(pair)
                 if age >= self.config.adaptive.max_hold_seconds:
                     self.portfolio.retire(pair, "maximum inventory holding time", now)
         if previous_entry_allowed != self.entry_allowed:
@@ -388,7 +422,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                                        if self.config.recovery.enabled else set()),
                                     allow_entries=self.equity > self.config.risk.reserve and self.entry_allowed,
                                     entry_check=self._entry_check if self.config.adaptive.enabled else None,
-                                    candidate_filter=self._candidate_filter if self.config.adaptive.enabled else None)
+                                    candidate_filter=self._candidate_filter if self.config.adaptive.enabled else None,
+                                    on_release=self._release_slot,
+                                    candidate_score=self._candidate_score if self.config.adaptive.enabled else None)
             after = {(p, s.state) for p, s in self.portfolio.slots.items()}
             if before != after:
                 self.logger().info(f"Portfolio slots: {sorted(after)}")
@@ -447,14 +483,24 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self.config.risk, self.config.adaptive, now, signal if protecting else None,
                     allow_open=self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair),
                     blocked_side=self.inventory.blocked_side(pair, now),
-                    gamma=self.gamma.value(pair),
+                    gamma=self.gamma.value(pair), quality=self._quality_snapshot(market),
+                    exit_cost_bps=self._exit_cost_bps(market),
                 )
                 self.plans[pair] = plan
+                quality_now = self._quality_snapshot(market)
+                previous_quality = self.last_quality_limits.get(pair, {})
+                if any((row.get("block", False) and not previous_quality.get(side, {}).get("block", False))
+                       or Decimal(row.get("penalty_bps", "0")) > Decimal(previous_quality.get(side, {}).get("penalty_bps", "0"))
+                       or Decimal(row.get("size_scale", "1")) < Decimal(previous_quality.get(side, {}).get("size_scale", "1"))
+                       for side, row in quality_now.items()):
+                    self._cancel_opening_orders(pair)
+                    self.next_quote[pair] = 0
                 self.recorder.decision(now, market, self.positions.get(pair, ZERO),
                                        self.inventory.age(pair, self.positions.get(pair, ZERO), now),
                                        self.config.risk, self.config.adaptive, signal if protecting else None,
                                        self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair), self.inventory.blocked_side(pair, now),
-                                       self.gamma.value(pair), plan)
+                                       self.gamma.value(pair), plan, quality=self._quality_snapshot(market),
+                                       exit_cost_bps=self._exit_cost_bps(market))
                 opening = any(not q.close for q in plan.intents)
                 existing_close = any(o.intent.pair == pair and o.intent.close for o in self.orders.values())
                 if not opening:
@@ -495,6 +541,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if now < self.next_quote.get(pair, 0):
                 continue
             if any(o.intent.pair == pair for o in self.orders.values()):
+                if self.config.adaptive.enabled and self._keep_quotes(pair, plan.intents, market, now):
+                    self.next_quote[pair] = now + self.config.quote_refresh_seconds
+                    self.recorder.record("quote_retained", now, pair=pair)
+                    continue
                 self._cancel_pair(pair)
                 continue
             if pair in self.exchange_open_pairs:
@@ -538,7 +588,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             return
         # One submission batch per reconciled account revision. This prevents
         # the second pair/tick reusing collateral before the exchange updates it.
-        if self.used_revision == self.revision:
+        selected = [intent for intent in selected if intent.close or self._heartbeat_ready(intent.pair)]
+        if not selected or self.used_revision == self.revision:
             return
         self.used_revision = self.revision
         for intent in selected:
@@ -618,17 +669,114 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     not contract.get("in_delisting", True),
                     funding_interval=float(contract.get("funding_interval", 28800)),
                     funding_next_at=float(contract.get("funding_next_apply", 0)),
+                    taker_fee=max(Decimal("0.0005"), Decimal(str(contract.get("taker_fee_rate", "0.0005"))),
+                                  self.connector.get_fee(base, quote, OrderType.MARKET, TradeType.BUY,
+                                                         self.config.risk.order_quote / mid, ask).percent),
                 )
             except (KeyError, IndexError, ValueError, ArithmeticError):
                 continue
         return snapshots
+
+    def _quality_regime(self, market):
+        if market is None:
+            return "calm"
+        signal = self.signals.get(market.pair)
+        return "stressed" if ((signal is not None and (signal.paused or signal.retire or signal.book_flow_conflict))
+                              or market.volatility / market.mid > self.config.adaptive.volatility_reference) else "calm"
+
+    def _quality_snapshot(self, market):
+        return self.quality.snapshot(market.pair, self._quality_regime(market), self.current_timestamp)
+
+    def _exit_cost_bps(self, market):
+        cfg = self.config.quality_control
+        if not cfg.enabled or cfg.mode != "protect":
+            return ZERO
+        return cfg.emergency_exit_probability * (max(ZERO, market.taker_fee - market.maker_fee) * 10000
+                                                 + cfg.exit_slippage_bps)
+
+    def _candidate_score(self, market):
+        # Bounded tie-breakers; observed markouts are not a profit forecast.
+        quality = self._quality_snapshot(market)
+        evidence = [Decimal(row["mean_net_bps"]) for row in quality.values() if row.get("ready")]
+        plan = quote_plan(market, ZERO, 0, self.config.risk, self.config.adaptive, self.current_timestamp,
+                          self.signals.get(market.pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None,
+                          gamma=self.gamma.value(market.pair), quality=quality, exit_cost_bps=self._exit_cost_bps(market))
+        margins = [(abs(q.price - plan.reference) / plan.reference - 2 * market.maker_fee) * 10000
+                   for q in plan.intents if not q.close]
+        margin = min(margins) - self._exit_cost_bps(market) if margins else ZERO
+        return market.score() + float(max(Decimal(-10), min(Decimal(10), margin))) / 10 + (
+            float(max(Decimal(-10), min(Decimal(10), min(evidence)))) / 10 if evidence else 0)
+
+    def _keep_quotes(self, pair, proposed, market, now):
+        cfg = self.config.execution
+        if not cfg.retain_quotes:
+            return False
+        working = [o for o in self.orders.values() if o.intent.pair == pair]
+        targets = {(q.buy, q.close): q for q in proposed}
+        if not working or len(working) != len(targets):
+            return False
+        threshold = max(2 * market.tick, market.mid * cfg.reprice_bps / 10000)
+        for order in working:
+            target = targets.get((order.intent.buy, order.intent.close))
+            if (target is None or order.cancel_at or order.intent.market or target.market
+                    or not 0 <= now - order.submitted_at < cfg.max_quote_age_seconds
+                    or abs(order.intent.price - target.price) >= threshold
+                    or not target.amount * (1 - cfg.size_tolerance) <= order.remaining <= target.amount):
+                return False
+        return True
+
+    def _heartbeat_ready(self, pair):
+        return (self.config.dry_run or not self.config.deadman.enabled
+                or self.heartbeat_deadlines.get(pair, 0) > self.current_timestamp + self.config.deadman.renew_seconds)
+
+    def _heartbeat_tick(self, now):
+        if self.config.dry_run or not self.config.deadman.enabled:
+            return
+        pairs = set(self.portfolio.slots) | {o.intent.pair for o in self.orders.values()}
+        for pair in pairs:
+            if not self._heartbeat_ready(pair):
+                self._cancel_opening_orders(pair)
+        if (not pairs or not self._account_fresh() or not self._opening_ready()
+                or (self.heartbeat_task is not None and not self.heartbeat_task.done())):
+            return
+        if now >= self.next_heartbeat or any(p not in self.heartbeat_deadlines for p in pairs):
+            self.next_heartbeat = now + self.config.deadman.renew_seconds
+            self.heartbeat_task = asyncio.create_task(self._renew_heartbeat(pairs))
+
+    async def _renew_heartbeat(self, pairs):
+        if self.config.dry_run or not self.config.deadman.enabled:
+            return
+        cfg = self.config.deadman
+        for pair in sorted(pairs):
+            sent_at = self.current_timestamp
+            try:
+                result = await asyncio.wait_for(self.connector._api_post(
+                    path_url=C.COUNTDOWN_CANCEL_PATH_URL,
+                    data={"timeout": cfg.timeout_seconds, "contract": pair.replace("-", "_")},
+                    is_auth_required=True), timeout=cfg.renew_seconds)
+                deadline = float(result["triggerTime"]) / 1000
+                if (not math.isfinite(deadline) or deadline <= self.current_timestamp + cfg.renew_seconds
+                        or deadline > sent_at + cfg.timeout_seconds + 5):
+                    raise ValueError("Invalid exchange cancellation countdown acknowledgement")
+                if not self._heartbeat_ready(pair):
+                    self.next_quote[pair] = 0
+                self.heartbeat_deadlines[pair] = deadline
+                self.heartbeat_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.heartbeat_deadlines.pop(pair, None)
+                self.heartbeat_error = f"exchange countdown unavailable: {exc}"
+                self._cancel_opening_orders(pair)
+                self.recorder.record("countdown_error", self.current_timestamp, pair=pair, reason=str(exc))
 
     def _entry_check(self, market):
         signal = self.signals.get(market.pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None
         if signal is not None and signal.paused:
             return "microstructure opening paused"
         return entry_rejection(market, self.config.risk, self.config.adaptive, self.current_timestamp, signal,
-                               gamma=self.gamma.value(market.pair))
+                               gamma=self.gamma.value(market.pair), quality=self._quality_snapshot(market),
+                               exit_cost_bps=self._exit_cost_bps(market))
 
     def _gamma_reprice_needed(self, pair, plan, market, now):
         if (plan.gamma == self.last_gamma_values.get(pair, plan.gamma)
@@ -701,6 +849,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.last_micro_limits[pair] = (signal.buy_scale, signal.sell_scale, signal.paused)
         if self.config.adaptive.enabled and pair in self.plans:
             self.last_control_limits[pair] = self._control_limits(pair, self.plans[pair])
+            market = self.last_markets.get(pair)
+            if market is not None:
+                self.last_quality_limits[pair] = self._quality_snapshot(market)
             self.last_gamma_values[pair] = self.plans[pair].gamma
 
     def _micro_telemetry(self, now):
@@ -853,16 +1004,33 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             if self.run_started_at is None:
                 self.run_started_at = self.current_timestamp
             epoch = self.account_epoch
-            positions, account, open_orders, cashflows = await asyncio.gather(
+            positions, account, open_orders = await asyncio.gather(
                 self.connector._api_get(path_url=C.POSITION_INFORMATION_URL, is_auth_required=True),
                 self.connector._api_get(path_url=C.USER_BALANCES_PATH_URL, is_auth_required=True),
                 self._open_orders(),
-                self._account_book(),
             )
             if epoch != self.account_epoch:
                 return
             if self.config.account_risk.enabled:
                 self.account_risk.validate_account(account)
+            if self.cash_journal is None and self.config.account_risk.enabled and self.config.account_risk.persist:
+                try:
+                    self.cash_journal = CashJournal(str(mode_path(self.config.account_risk.state_path, self.config.dry_run)) + ".cash.sqlite",
+                                                    account["user"], self.run_started_at)
+                except Exception as exc:
+                    self.cash_error = f"cash journal unavailable: {exc}"
+            cashflows = None
+            try:
+                if self.config.account_risk.enabled and self.config.account_risk.persist and self.cash_journal is None:
+                    raise RuntimeError(self.cash_error)
+                cashflows = await self._account_book()
+                self.cash_error = ""
+            except Exception as exc:
+                self.cash_error = f"cash reconciliation pending: {exc}"
+                self.logger().warning(self.cash_error)
+                # Position/order ownership is still independently reconciled
+                # below. A cash-history failure never authorizes new risk.
+                cashflows = self.cashflows if isinstance(self.cashflows, AccountBookSnapshot) else AccountBookSnapshot()
             recovering = self.config.recovery.enabled and self.recovery.recovering and not self.config.dry_run
             if recovering:
                 known = set(self.recovery.orders) | set(self.orders)
@@ -942,35 +1110,47 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.position_quote = position_quote
             self.position_marks = position_marks
             self.unrealised_pnl = unrealised_pnl
-            if not self.initialized and self.account_risk.anchor is None:
+            if (self.account_risk.anchor is None if self.config.account_risk.enabled else not self.initialized) and not self.cash_error:
                 # Ignore historical records already present before any bot orders.
-                self.initial_book_ids = set(cashflows)
+                self.initial_book_ids = set(cashflows.records) if self.config.account_risk.enabled else set(cashflows)
             self.cashflows = cashflows
             self.available = Decimal(str(account["available"]))
             self.equity = Decimal(str(account["total"])) + Decimal(str(account.get("unrealised_pnl", "0")))
             if not self.available.is_finite() or not self.equity.is_finite():
                 raise ValueError("Invalid account balances")
-            if self.config.account_risk.enabled:
+            if self.config.account_risk.enabled and (self.account_risk.anchor is not None or not self.cash_error):
                 self.account_risk.observe(account, cashflows.records, sum(unrealised_pnl.values(), ZERO),
-                                          self.current_timestamp, self.config.risk.reserve)
+                                          self.current_timestamp, self.config.risk.reserve,
+                                          cash_totals=getattr(cashflows, "cash_totals", None) if self.account_risk.anchor is not None else None)
+                if not self.cash_error:
+                    try:
+                        if self.cash_journal is not None and self.account_risk.reconciliation_error:
+                            self.cash_journal.request_rescan()
+                        self._check_closed_losses()
+                    except Exception as exc:
+                        self.cash_error = f"closed-cycle reconciliation pending: {exc}"
                 self._checkpoint()
                 if not self._opening_ready():
                     self._cancel_opening_orders()
             if self.config.recovery.enabled:
                 if recovering:
-                    if self.account_risk.reconciliation_error or self.persistence_error:
-                        self.recovery.wait(self.account_risk.reconciliation_error or self.persistence_error)
+                    self._recovery_verified = True  # Position and order ownership are proven; CLOSE may proceed.
+                    if self.account_risk.reconciliation_error or self.persistence_error or self.cash_error:
+                        self.recovery.wait(self.cash_error or self.account_risk.reconciliation_error or self.persistence_error)
                     else:
                         self._recovery_verified = True
                         fingerprint = json.dumps(dict(positions={p: str(a) for p, a in sorted(converted.items())},
                                                        open_ids=sorted(o.get("text", "") for o in open_orders),
-                                                       cash_ids=sorted(cashflows.records)), sort_keys=True)
+                                                       cash_ids=getattr(cashflows, "revision", sorted(cashflows.records))), sort_keys=True)
                         if self.recovery.confirm(fingerprint, self.current_timestamp):
                             self.recovery.phase, self.recovery.reason = "ready", "exchange reconciliation complete"
                             self.recorder.record("recovery_complete", self.current_timestamp, positions=converted)
                 if not self.recovery.recovering or self._recovery_verified:
+                    durable = self._checkpoint()
                     for client_id in self._recovery_pending_settlements:
-                        self.recovery.orders.pop(client_id, None)
+                        if durable:
+                            self.recovery.orders.pop(client_id, None)
+                        self.orders.pop(client_id, None)
                         self.terminal_orders.pop(client_id, None)
                         self._restart_order_ids.discard(client_id)
                         if hasattr(self.connector, "stop_tracking_order"):
@@ -1042,11 +1222,66 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         position's realised_pnl, which includes the same settlements.
         """
         selected_at = self.portfolio.slots[pair].selected_at
+        if self.cash_journal is not None:
+            try:
+                return self.cash_journal.pair_total(pair, selected_at, self.initial_book_ids) + self.unrealised_pnl.get(pair, ZERO)
+            except Exception as exc:
+                self.cash_error = f"pair cash lookup failed: {exc}"
         settled = sum((change for record_id, (p, timestamp, change) in self.cashflows.items()
                        if p == pair and timestamp >= selected_at and record_id not in self.initial_book_ids), ZERO)
         return settled + self.unrealised_pnl.get(pair, ZERO)
 
+    def _release_slot(self, slot, now):
+        if self.cash_journal is None:
+            return not self.cash_error
+        try:
+            self.cash_journal.end_cycle(slot.pair, slot.selected_at, now)
+            return True
+        except Exception as exc:
+            self.cash_error = f"cannot archive slot settlement: {exc}"
+            return False
+
+    def _check_closed_losses(self):
+        if self.cash_journal is None:
+            return
+        for pair, start, ended in self.cash_journal.closed_cycles():
+            if pair in self.portfolio.excluded:
+                continue
+            pnl = self.cash_journal.pair_total(pair, start, self.initial_book_ids)
+            if pnl <= -self.config.risk.pair_loss_limit:
+                if pair in self.portfolio.slots:
+                    self.portfolio.stop_loss(pair, pnl, self.current_timestamp)
+                    self._cancel_pair(pair)
+                self.portfolio.excluded.add(pair)
+                if self.config.adaptive.enabled:
+                    self.loss_circuit.record(pair, self.current_timestamp)
+                self.next_monitor = 0
+                self.recorder.record("late_pair_stop", self.current_timestamp, pair=pair, selected_at=start, pnl=pnl)
+
     async def _account_book(self):
+        if self.cash_journal is None:
+            return await self._legacy_account_book()
+        # Periodic backfill also captures small late records below the account
+        # reconciliation tolerance and outside the overlap window.
+        if (self.current_timestamp - self.cash_journal.get("last_full_scan", self.run_started_at) >= 3600
+                and self.cash_journal.get("pending") is None):
+            self.cash_journal.request_rescan()
+        for _ in range(self.cash_journal.pages_per_poll):
+            interval = self.cash_journal.page_range(self.current_timestamp)
+            start, end, offset = interval
+            page = await self.connector._api_get(
+                path_url="futures/usdt/account_book", is_auth_required=True, limit_id=C.USER_BALANCES_PATH_URL,
+                params={"from": start, "to": end, "limit": 1000, "offset": offset})
+            if self.cash_journal.ingest(page, interval):
+                if end >= int(self.current_timestamp):
+                    with self.cash_journal.db:
+                        if self.cash_journal.get("rescan", False) or self.cash_journal.get("last_full_scan") is None:
+                            self.cash_journal.put("last_full_scan", self.current_timestamp)
+                        self.cash_journal.put("rescan", False)
+                    return self.cash_journal.snapshot(self.initial_book_ids, bootstrap=self.account_risk.anchor is None)
+        raise RuntimeError("Cash history catch-up continues on the next poll; new risk paused")
+
+    async def _legacy_account_book(self):
         # Re-read this run's fixed time range rather than advancing a timestamp
         # cursor: late fee/settlement records must not disappear between polls.
         # IDs deduplicate records; offsets apply to a fixed 'to' on every page.
@@ -1134,6 +1369,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         return Intent(pair, buy, abs(amount), price, close=True, market=use_market)
 
     def _submit(self, intent):
+        if not intent.close and not self._heartbeat_ready(intent.pair):
+            return
         if not intent.close and (not self.entry_allowed or not self._opening_ready() or not self._checkpoint()):
             return
         if not self.recorder.record("submit_intent", self.current_timestamp, intent=intent, revision=self.revision):
@@ -1254,11 +1491,17 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 if len(self.fill_id_queue) > 10000:
                     self.fill_ids.discard(self.fill_id_queue.popleft())
             slot = self.portfolio.slots.get(order.intent.pair)
+            if self.cash_journal is not None and slot is not None:
+                try:
+                    self.cash_journal.own_trade(slot.pair, trade_id, slot.selected_at)
+                except Exception as exc:
+                    self.cash_error = f"cannot persist cash trade ownership: {exc}"
             self.recorder.fill(self.current_timestamp, order.intent.pair, event.order_id, trade_id,
                                event.amount, getattr(event, "price", order.intent.price), order.intent.buy,
                                order.intent.close, order.intent.market, getattr(event, "timestamp", self.current_timestamp),
                                self.last_markets.get(order.intent.pair), getattr(event, "trade_fee", None),
-                               slot.reason if slot is not None and order.intent.close else "")
+                               slot.reason if slot is not None and order.intent.close else "",
+                               regime=self._quality_regime(self.last_markets.get(order.intent.pair)))
             order.remaining = max(ZERO, order.remaining - event.amount)
             pair = order.intent.pair
             change = event.amount if order.intent.buy else -event.amount
@@ -1301,6 +1544,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if self.stopping:
             return
         self.stopping = True
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+        # Leave the exchange countdown armed after stopping.
         if self.refresh_task and not self.refresh_task.done():
             self.refresh_task.cancel()
             await asyncio.gather(self.refresh_task, return_exceptions=True)
@@ -1311,6 +1558,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                              pending_markouts=len(self.recorder.pending))
         if self.risk_store is not None:
             self.risk_store.close()
+        if self.cash_journal is not None:
+            self.cash_journal.close()
         if getattr(self.connector, "_gate_market_signal_feed", None) is self.signal_feed:
             delattr(self.connector, "_gate_market_signal_feed")
         # Hummingbot stopping removes the strategy clock. Do not claim that a
@@ -1331,8 +1580,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             lines.append(f"Recovery: phase={self.recovery.phase}, reason={self.recovery.reason or '-'}, "
                          f"unsettled_orders={len(self.recovery.orders)}, terminal_settlement_block={self._recovery_block_open}, "
                          f"correlation_wait={sorted(self._recovery_correlation_pairs)}")
-        if self.persistence_error or self.recorder.error:
-            lines.append(f"Opening paused: {self.persistence_error or self.recorder.error}")
+        if self.persistence_error or self.recorder.error or self.cash_error or self.heartbeat_error:
+            lines.append(f"Opening paused: {self.persistence_error or self.recorder.error or self.cash_error or self.heartbeat_error}")
+        lines.append(f"Quality: {self.config.quality_control.mode}; retained quotes={self.config.execution.retain_quotes}; "
+                     f"exchange countdown={self.config.deadman.enabled}")
         if self.config.adaptive.enabled:
             lines.append(f"Adaptive controls: opening allowed={self.entry_allowed}, circuit_until={self.loss_circuit.until}, "
                          f"gross cap={self.config.adaptive.max_gross_quote}, directional cap={self.config.adaptive.max_directional_quote}")

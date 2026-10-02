@@ -136,7 +136,8 @@ def _close_quote(market, position, risk, price):
 
 def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, settings: AdaptiveSettings,
                now: float, signal: Optional[MicroSignal] = None, allow_open: bool = True,
-               blocked_side: Optional[bool] = None, gamma: Optional[Decimal] = None) -> QuotePlan:
+               blocked_side: Optional[bool] = None, gamma: Optional[Decimal] = None,
+               quality=None, exit_cost_bps: Decimal = ZERO) -> QuotePlan:
     gamma = risk.gamma if gamma is None else gamma
     plan = QuotePlan(gamma=gamma)
     unsafe = market.close_rejection(risk, now)
@@ -177,7 +178,10 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     for buy in (True, False):
         premium = plan.buy_premium if buy else plan.sell_premium
         floor = fee_floor + _carry(market, buy, now, settings) + premium
-        half = max(opening_half + premium, floor)
+        evidence = (quality or {}).get(str(buy), {})
+        learned = D(evidence.get("penalty_bps", "0")) / D(10000)
+        extra = learned + exit_cost_bps / D(10000)
+        half = max(opening_half + premium + extra, floor + extra)
         prices[buy] = center + (-ONE if buy else ONE) * half * market.mid
         # Greater risk aversion improves inventory reduction through the center;
         # it must not widen the reducing side's volatility component.
@@ -186,9 +190,12 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     plan.intents = _close_quote(market, position, risk, close_price)
     opens = []
     for buy in (True, False):
+        evidence = (quality or {}).get(str(buy), {})
         if (buy and position < 0) or (not buy and position > 0):
             continue
-        if plan.stage == "reduce_only" or blocked_side is buy:
+        if plan.stage == "reduce_only" or blocked_side is buy or evidence.get("block", False):
+            if evidence.get("block", False):
+                plan.entry_reason = "observed maker execution quality is negative"
             continue
         price = (floor_step(min(prices[buy], market.bid), market.tick) if buy else
                  (max(prices[buy], market.ask) / market.tick).to_integral_value(rounding=ROUND_CEILING) * market.tick)
@@ -196,7 +203,7 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
             plan.entry_reason = "invalid proposed opening price"
             continue
         distance = (plan.reference - price if buy else price - plan.reference) / market.mid
-        required = fee_floor + _carry(market, buy, now, settings)
+        required = fee_floor + _carry(market, buy, now, settings) + (exit_cost_bps + D(evidence.get("penalty_bps", "0"))) / D(10000)
         attenuation = D(str(math.exp(-min(700, float(market.kappa * abs(price - market.mid))))))
         if distance < required:
             plan.entry_reason = "proposed opening edge below costs"
@@ -213,6 +220,7 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
             amount *= max(ZERO, ONE - min(ONE, ratio)) ** settings.inventory_power
         if signal is not None:
             amount *= signal.buy_scale if buy else signal.sell_scale
+        amount *= D(evidence.get("size_scale", "1"))
         amount = floor_step(amount, market.step)
         if amount >= market.minimum:
             opens.append(Intent(market.pair, buy, amount, price))
@@ -222,8 +230,8 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     return plan
 
 
-def entry_rejection(market, risk, settings, now, signal=None, gamma=None):
-    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal, gamma=gamma)
+def entry_rejection(market, risk, settings, now, signal=None, gamma=None, quality=None, exit_cost_bps=ZERO):
+    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal, gamma=gamma, quality=quality, exit_cost_bps=exit_cost_bps)
     return None if len(plan.intents) == 2 else plan.entry_reason or "no executable adaptive opening"
 
 

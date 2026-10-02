@@ -62,7 +62,7 @@ def fee_in_usdt(fee, amount, price):
 class QualityRecorder:
     horizons = (1, 5, 30)
 
-    def __init__(self, settings, dry_run):
+    def __init__(self, settings, dry_run, on_markout=None):
         self.settings = settings
         self.path = mode_path(settings.path, dry_run)
         self.session = uuid.uuid4().hex
@@ -70,6 +70,7 @@ class QualityRecorder:
         self.error = ""
         self.next_sample = 0
         self.pending = []
+        self.on_markout = on_markout
 
     def record(self, kind, now, **values):
         if not self.settings.enabled:
@@ -95,7 +96,7 @@ class QualityRecorder:
             return False
 
     def fill(self, now, pair, order_id, trade_id, amount, price, buy, close, market,
-             timestamp, anchor_market=None, fee=None, exit_reason=""):
+             timestamp, anchor_market=None, fee=None, exit_reason="", regime="calm"):
         if not self.settings.enabled:
             return
         timestamp = timestamp if math.isfinite(timestamp) and 0 <= timestamp <= now else now
@@ -106,7 +107,7 @@ class QualityRecorder:
         fee_estimate = fee_in_usdt(fee, amount, price)
         fill = dict(fill_id=fill_id, pair=pair, order_id=order_id, trade_id=trade_id,
                     amount=amount, price=price, buy=buy, close=close, market=market,
-                    filled_at=timestamp, anchor_mid=anchor, fee_estimate_usdt=fee_estimate, exit_reason=exit_reason)
+                    filled_at=timestamp, anchor_mid=anchor, fee_estimate_usdt=fee_estimate, exit_reason=exit_reason, regime=regime)
         self.record("fill", now, **fill)
         self.pending.append(dict(**fill, remaining=set(self.horizons)))
 
@@ -141,12 +142,15 @@ class QualityRecorder:
                 else:
                     values["reason"] = "no fresh observation within horizon window"
                 if self.record("markout", now, **values):
+                    if self.on_markout is not None:
+                        self.on_markout(fill, values)
                     fill["remaining"].remove(horizon)
         self.pending = [fill for fill in self.pending if fill["remaining"]]
 
-    def decision(self, now, market, position, age, risk, adaptive, signal, allow_open, blocked_side, gamma, plan):
+    def decision(self, now, market, position, age, risk, adaptive, signal, allow_open, blocked_side, gamma, plan,
+                 quality=None, exit_cost_bps=Decimal(0)):
         return self.record("decision", now, market=market, position=position, age=age, risk=risk,
-                           adaptive=adaptive, signal=signal, allow_open=allow_open,
+                           adaptive=adaptive, signal=signal, allow_open=allow_open, quality=quality, exit_cost_bps=exit_cost_bps,
                            blocked_side=blocked_side, gamma=gamma, expected=plan)
 
 
@@ -163,7 +167,8 @@ def replay_decision(record):
     plan = quote_plan(market, Decimal(record["position"]), record["age"],
                       dataclass_from_json(Settings, record["risk"]),
                       dataclass_from_json(AdaptiveSettings, record["adaptive"]), record["at"], signal,
-                      allow_open=record["allow_open"], blocked_side=record["blocked_side"], gamma=Decimal(record["gamma"]))
+                      allow_open=record["allow_open"], blocked_side=record["blocked_side"], gamma=Decimal(record["gamma"]),
+                      quality=record.get("quality"), exit_cost_bps=Decimal(record.get("exit_cost_bps", "0")))
     return plain(plan) == record["expected"]
 
 
@@ -189,7 +194,25 @@ def audit_report(records):
                                       missing_or_pending=max(0, len(fills) - len(observations)),
                                       mean_bps=str(sum((Decimal(r["bps"]) for r in observations), Decimal(0)) / len(observations))
                                       if observations else None)
-    return dict(fills=len(fills), close_fills=sum(r["close"] for r in fills),
+    by_pair = {}
+    for pair in sorted({r["pair"] for r in fills}):
+        pair_fills = [r for r in fills if r["pair"] == pair]
+        order_ids = {(r["session"], r["order_id"]) for r in pair_fills}
+        samples = []
+        for fill in pair_fills:
+            obs = markouts.get((fill["session"], fill["fill_id"], 5))
+            if obs and obs["observed"] and obs.get("fee_adjusted_estimate_usdt") is not None:
+                samples.append((Decimal(obs["fee_adjusted_estimate_usdt"]), Decimal(fill["amount"]) * Decimal(fill["price"])))
+        notional = sum((row[1] for row in samples), Decimal(0))
+        by_pair[pair] = dict(fills=len(pair_fills), distinct_filled_orders=len(order_ids),
+                            maker_fills=sum(not r["market"] for r in pair_fills),
+                            taker_fills=sum(r["market"] for r in pair_fills),
+                            five_second_observations=len(samples),
+                            five_second_fee_adjusted_bps=str(sum((r[0] for r in samples), Decimal(0)) / notional * 10000)
+                            if notional else None,
+                            cancel_requests=sum(r["kind"] == "cancel_requested" and r.get("pair") == pair for r in rows),
+                            quote_retained=sum(r["kind"] == "quote_retained" and r.get("pair") == pair for r in rows))
+    return dict(fills=len(fills), close_fills=sum(r["close"] for r in fills), by_pair=by_pair,
                 replay_checked=len(decisions), replay_mismatches=sum(not replay_decision(r) for r in decisions),
                 markouts=by_horizon, latest_account=latest,
                 note="Observed markouts are not realized strategy profit; no synthetic fills. Missing rotated logs limit coverage.")

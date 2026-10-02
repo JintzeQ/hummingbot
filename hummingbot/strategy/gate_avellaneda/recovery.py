@@ -78,7 +78,7 @@ class RecoveryLedger:
         if finite(amount) <= 0 or finite(price) <= 0:
             raise ValueError("Invalid recovery fill")
         if trade_id in row["fills"]:
-            if any(row["fills"][trade_id][key] != value[key] for key in ("amount", "price")):
+            if any(finite(row["fills"][trade_id][key]) != finite(value[key]) for key in ("amount", "price")):
                 raise ValueError("Exchange trade ID changed its fill values")
             return False
         intent = intent_from_json(row["intent"])

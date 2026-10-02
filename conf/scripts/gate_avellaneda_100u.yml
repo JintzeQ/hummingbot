@@ -27,6 +27,27 @@ account_risk:
   max_drawdown: '10'
   reconciliation_tolerance: '0.01'
   timezone: Asia/Taipei
+deadman:
+  enabled: true
+  timeout_seconds: 30 # exchange cancels contract orders; does not flatten positions
+  renew_seconds: 10
+execution:
+  retain_quotes: true
+  max_quote_age_seconds: 60
+  reprice_bps: '2'
+  size_tolerance: '0.1'
+quality_control:
+  enabled: true # requires adaptive pricing and observed-fill telemetry
+  mode: protect # observe collects evidence without changing execution
+  min_orders: 30
+  max_orders: 200
+  window_seconds: 3600
+  confidence_z: 2 # heuristic standard-error multiplier, not a calibrated guarantee
+  max_penalty_bps: '20'
+  uncertain_size_scale: '0.5'
+  emergency_exit_probability: '0.1' # configured reserve assumption, not fitted probability
+  exit_slippage_bps: '2'
+  soft_exit_age_seconds: 120
 telemetry:
   enabled: true
   path: logs/gate_avellaneda_quality.jsonl

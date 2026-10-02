@@ -76,6 +76,7 @@ class Market:
     enabled: bool = True
     funding_interval: float = 28800
     funding_next_at: float = 0
+    taker_fee: Decimal = D("0.0005")
 
     @property
     def mid(self) -> Decimal:
@@ -161,13 +162,16 @@ class Portfolio:
 
     def evaluate(self, markets: Dict[str, Market], now: float, account_fresh: bool,
                  positions: Dict[str, Decimal], open_pairs: Set[str], allow_entries: bool = True,
-                 entry_check: Optional[Callable] = None, candidate_filter: Optional[Callable] = None) -> None:
+                 entry_check: Optional[Callable] = None, candidate_filter: Optional[Callable] = None,
+                 on_release: Optional[Callable] = None, candidate_score: Optional[Callable] = None) -> None:
         if not account_fresh:
             return
         reject = entry_check or (lambda market: market.rejection(self.settings, now))
         for pair, slot in list(self.slots.items()):
             if slot.state == "retiring":
                 if positions.get(pair, ZERO) == 0 and pair not in open_pairs:
+                    if on_release and not on_release(slot, now):
+                        continue
                     del self.slots[pair]
                     self.cooldowns[pair] = now + self.settings.cooldown
                 continue
@@ -185,7 +189,7 @@ class Portfolio:
         candidates = sorted(
             (m for m in markets.values() if m.pair not in self.slots and m.pair not in self.excluded
              and now >= self.cooldowns.get(m.pair, 0) and reject(m) is None),
-            key=lambda m: (-m.score(), m.pair),
+            key=lambda m: (-(candidate_score(m) if candidate_score else m.score()), m.pair),
         )
         for market in candidates:
             if len(self.slots) >= 2:

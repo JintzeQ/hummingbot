@@ -24,7 +24,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             for p in pairs
         }
         self.connector = FakeConnector(pairs)
-        self.config = adapter.GateAvellanedaPortfolioConfig(account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False), micro=dict(enabled=False), adaptive=dict(enabled=False))
+        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False), micro=dict(enabled=False), adaptive=dict(enabled=False))
         self.bot = adapter.GateAvellanedaPortfolio({"gate_io_perpetual": self.connector}, self.config)
 
     async def ready(self, live=False):
@@ -527,8 +527,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.selected()
         self.connector.account_book = [self.book_record(i, "-0.001") for i in range(10000)]
         await self.bot._refresh()
-        self.assertIn("Account-book pagination limit", self.bot.halt_reason)
-        self.assertTrue(self.bot.account_dirty)
+        self.assertIn("Account-book pagination limit", self.bot.cash_error)
+        self.assertFalse(self.bot.account_dirty)
+        self.assertFalse(self.bot._opening_ready())
 
     async def test_invalid_ledger_data_and_non_usdt_fees_are_rejected(self):
         await self.selected()
@@ -553,7 +554,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.connector._api_get = failure
         await self.bot._refresh()
         self.bot.on_tick()
-        self.assertTrue(self.bot.account_dirty)
+        self.assertFalse(self.bot.account_dirty)
+        self.assertTrue(self.bot.cash_error)
+        self.assertFalse(self.bot._opening_ready())
         self.assertEqual(self.connector.sent, [])
 
     async def test_invalid_unrealised_pnl_and_dry_run_stop_never_submit(self):
@@ -600,7 +603,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
 class BootstrapTests(unittest.TestCase):
     def test_public_startup_builds_candidate_subscription_pool(self):
-        config = adapter.GateAvellanedaPortfolioConfig(candidate_limit=2)
+        config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), candidate_limit=2)
         contracts = [contract(p) for p in ("A-USDT", "B-USDT", "C-USDT")]
         tickers = [dict(contract=p.replace("-", "_"), last="10", volume_24h_quote="10000000")
                    for p in ("A-USDT", "B-USDT", "C-USDT")]
@@ -612,15 +615,15 @@ class BootstrapTests(unittest.TestCase):
     def test_empty_universe_fails_with_message(self):
         with patch.object(adapter, "urlopen", side_effect=[io.BytesIO(b"[]"), io.BytesIO(b"[]")]):
             with self.assertRaisesRegex(ValueError, "No affordable"):
-                adapter.GateAvellanedaPortfolio.init_markets(adapter.GateAvellanedaPortfolioConfig())
+                adapter.GateAvellanedaPortfolio.init_markets(adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), ))
 
     def test_pydantic_validates_nested_budget(self):
         with self.assertRaises(ValueError):
-            adapter.GateAvellanedaPortfolioConfig(risk=dict(capital="50"))
+            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk=dict(capital="50"))
 
     def test_refresh_period_must_fit_staleness_threshold(self):
         with self.assertRaisesRegex(ValueError, "max_age"):
-            adapter.GateAvellanedaPortfolioConfig(book_refresh_seconds=30)
+            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), book_refresh_seconds=30)
 
 
 class ConnectorRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -658,8 +661,8 @@ class ConnectorRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["size"], -100)
             self.assertEqual(payload["tif"], "ioc" if kind == OrderType.MARKET else "poc")
         exchange._api_post.return_value = dict(id=124, finish_as="cancelled")
-        with self.assertRaises(IOError):
-            await method(exchange, "t-test", "A-USDT", D("0.1"), TradeType.BUY, OrderType.LIMIT, D("10"))
+        result = await method(exchange, "t-test", "A-USDT", D("0.1"), TradeType.BUY, OrderType.LIMIT, D("10"))
+        self.assertEqual(result[0], "124")
 
     async def test_real_gate_trade_parser_accepts_string_sizes(self):
         namespace = dict(Decimal=D, TradeType=TradeType,
