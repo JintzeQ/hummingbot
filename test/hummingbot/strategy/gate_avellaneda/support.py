@@ -101,7 +101,9 @@ def module(name, **attributes):
 constants = module("hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_constants",
                    POSITION_INFORMATION_URL="positions", USER_BALANCES_PATH_URL="account",
                    USER_ORDERS_PATH_URL="orders", NETWORK_CHECK_PATH_URL="network",
-                   TICKER_PATH_URL="tickers", ORDER_BOOK_PATH_URL="book", ORDER_CREATE_PATH_URL="create")
+                   TICKER_PATH_URL="tickers", ORDER_BOOK_PATH_URL="book", ORDER_CREATE_PATH_URL="create",
+                   ORDER_STATUS_PATH_URL="futures/usdt/orders/{id}", ORDER_STATUS_LIMIT_ID="OrderStatus",
+                   ORDER_DELETE_LIMIT_ID="OrderDelete", MY_TRADES_PATH_URL="futures/usdt/my_trades")
 
 
 def load_adapter():

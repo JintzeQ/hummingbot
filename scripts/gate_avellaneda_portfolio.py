@@ -2,16 +2,19 @@
 
 Subscribe to a bounded candidate pool once at startup. Only occupied slots are
 quoted; replacements are drawn from that live pool, not from a fixed two-pair
-list. A restart rebuilds the pool from the current futures volume ranking.
+list. A restart includes checkpoint-owned markets before filling the pool from
+the current futures volume ranking.
 """
 
 import asyncio
 import json
 import math
 import os
+import re
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import ClassVar, Dict, List
 from urllib.request import urlopen
 
@@ -31,11 +34,12 @@ from hummingbot.strategy.gate_avellaneda.adaptive import (
     AdaptiveSettings, InventoryTracker, LossCircuit, ReturnHistory, entry_rejection,
     exposure_bounds, exposure_scale, limit_exposure, quote_plan,
 )
-from hummingbot.strategy.gate_avellaneda.gamma import GammaController, GammaSettings
+from hummingbot.strategy.gate_avellaneda.gamma import GammaController, GammaSettings, GammaState
 from hummingbot.strategy.gate_avellaneda.account_risk import (
-    AccountBookSnapshot, AccountRisk, AccountRiskSettings, RiskStateStore, finite_time, mode_path,
+    AccountBookSnapshot, AccountRisk, AccountRiskSettings, RiskStateStore, finite, finite_time, mode_path,
 )
-from hummingbot.strategy.gate_avellaneda.verification import QualityRecorder, TelemetrySettings
+from hummingbot.strategy.gate_avellaneda.verification import QualityRecorder, TelemetrySettings, plain
+from hummingbot.strategy.gate_avellaneda.recovery import RecoveryLedger, RecoverySettings, intent_from_json, recovery_pairs
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
 from hummingbot.strategy.gate_avellaneda.microstructure import GateMarketSignalFeed, MicroSettings
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -50,6 +54,7 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     gamma_control: GammaSettings = Field(default_factory=GammaSettings)
     account_risk: AccountRiskSettings = Field(default_factory=AccountRiskSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+    recovery: RecoverySettings = Field(default_factory=RecoverySettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -63,6 +68,8 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
 
     @model_validator(mode="after")
     def validate_refresh_age(self):
+        if self.recovery.enabled and (not self.account_risk.enabled or not self.account_risk.persist):
+            raise ValueError("Recovery requires persistent account risk")
         if not self.dry_run and self.account_risk.enabled and not self.account_risk.persist:
             raise ValueError("Live account risk requires persistent state")
         if self.risk.max_age <= self.book_refresh_seconds + self.account_refresh_seconds:
@@ -99,6 +106,20 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         cls._initial_contracts = candidate_universe(
             contracts, tickers, config.risk, config.candidate_limit, config.candidate_pairs,
         )
+        if config.recovery.enabled:
+            payload = RiskStateStore.read_file(mode_path(config.account_risk.state_path, config.dry_run))
+            if payload is not None:
+                if payload["scope"] != "gate_io_perpetual/usdt/classic" or payload["dry_run"] is not config.dry_run:
+                    raise ValueError("Recovery state scope/mode mismatch")
+                needed = recovery_pairs(payload)
+                available = {c["name"].replace("_", "-"): c for c in contracts}
+                if not needed.issubset(available) or len(needed) > config.candidate_limit:
+                    raise ValueError("Cannot subscribe to all checkpoint-owned contracts")
+                pool = {p: available[p] for p in sorted(needed)}
+                for pair, contract in cls._initial_contracts.items():
+                    if len(pool) < config.candidate_limit:
+                        pool.setdefault(pair, contract)
+                cls._initial_contracts = pool
         if not cls._initial_contracts:
             raise ValueError("No affordable USDT perpetual candidate meets the configured universe filters")
         cls._initial_tickers = {t["contract"].replace("_", "-"): t for t in tickers}
@@ -163,6 +184,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.stopping = False
         self.account_risk = AccountRisk(config.account_risk)
         self.recorder = QualityRecorder(config.telemetry, config.dry_run)
+        self.recovery = RecoveryLedger(config.recovery)
+        self._replaying_fills = False
+        self._recovery_pending_settlements = set()
+        self._recovery_block_open = False
+        self._restart_order_ids = set()
+        self._recovery_verified = False
+        self._recovery_correlation_pairs = set()
         self.risk_store = None
         self.persistence_error = ""
         self._saved_payload = None
@@ -194,7 +222,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 and self.current_timestamp - self.account_at <= self.config.risk.max_age)
 
     def _opening_ready(self):
-        return self.account_risk.allow_open and not self.persistence_error and not self.recorder.error
+        return (self.account_risk.allow_open and not self.persistence_error and not self.recorder.error
+                and not self.recovery.recovering and not self._recovery_block_open)
 
     def _restore_checkpoint(self, payload):
         if payload["dry_run"] is not self.config.dry_run or payload["scope"] != "gate_io_perpetual/usdt/classic":
@@ -221,6 +250,37 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.loss_circuit.seen = set(circuit["seen"])
         self.loss_circuit.until = finite_time(circuit["until"])
         self.loss_circuit.healthy_since = self.loss_circuit.last_check = None
+        if self.config.recovery.enabled and "recovery" in payload:
+            self.expected_positions = self.recovery.restore(payload["recovery"], self.portfolio, self.inventory)
+            if not recovery_pairs(payload).issubset(self.contracts):
+                raise ValueError("Checkpoint-owned contracts are absent from startup subscriptions")
+            for client_id, row in self.recovery.orders.items():
+                intent = intent_from_json(row["intent"])
+                order = TrackedOrder(intent, intent.amount - self.recovery.filled(client_id), row["submitted_at"])
+                self.terminal_orders[client_id] = order
+            self.entry_allowed = False
+            self._restart_order_ids = set(self.recovery.orders)
+            for pair, state in payload["recovery"].get("gamma_states", {}).items():
+                if pair not in self.portfolio.slots:
+                    raise ValueError("Persistent Gamma has no owning slot")
+                components = {name: finite(value) for name, value in state["components"].items()}
+                if any(name not in ("volatility", "depth", "micro", "loss") or not ZERO <= value <= 1
+                       for name, value in components.items()):
+                    raise ValueError("Invalid persistent Gamma stress")
+                bounds = self.config.gamma_control
+                value = max(bounds.minimum, min(bounds.maximum, finite(state["value"])))
+                target = max(bounds.minimum, min(bounds.maximum, finite(state["target"])))
+                self.gamma.states[pair] = GammaState(value, target, min(finite_time(state["updated_at"]), self.account_risk.last_at), components)
+            if self.config.dry_run:
+                if self.recovery.orders or any(self.expected_positions.values()):
+                    raise ValueError("Dry-run checkpoint unexpectedly contains execution ownership")
+                self.recovery.phase, self.recovery.reason = "ready", "dry-run state restored; no execution recovery"
+            elif self.config.adaptive.enabled and self.config.adaptive.require_correlation and len(self.portfolio.slots) > 1:
+                self._recovery_correlation_pairs = set(self.portfolio.slots)
+            if self.config.candidate_pairs:
+                for pair in self.portfolio.slots:
+                    if pair not in self.config.candidate_pairs:
+                        self.portfolio.retire(pair, "recovered contract removed from configured universe", self.account_risk.last_at)
 
     def _checkpoint(self):
         if self.risk_store is None or self.account_risk.anchor is None:
@@ -230,6 +290,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                        excluded=sorted(self.portfolio.excluded), cooldowns=self.portfolio.cooldowns.copy(),
                        circuit=dict(events=list(self.loss_circuit.events), seen=sorted(self.loss_circuit.seen),
                                     until=self.loss_circuit.until))
+        if self.config.recovery.enabled:
+            payload["recovery"] = self.recovery.dump(self.expected_positions, self.portfolio, self.inventory)
+            payload["recovery"]["gamma_states"] = {p: plain(asdict(state)) for p, state in self.gamma.states.items()
+                                                   if p in self.portfolio.slots}
         try:
             if payload != self._saved_payload or self.persistence_error:
                 self.risk_store.save(payload)
@@ -276,6 +340,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if not self._opening_ready():
             self._cancel_opening_orders()
         fresh = self._account_fresh()
+        if self.recovery.recovering and not self._recovery_verified:
+            return
         if not fresh:
             if self.config.adaptive.enabled:
                 self.loss_circuit.allow_open(now, False, self.config.risk.max_age)
@@ -317,7 +383,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if now >= self.next_monitor:
             before = {(p, s.state) for p, s in self.portfolio.slots.items()}
             self.portfolio.evaluate(snapshots, now, fresh, self.positions,
-                                    self.exchange_open_pairs | {o.intent.pair for o in self.orders.values()},
+                                    self.exchange_open_pairs | {o.intent.pair for o in self.orders.values()}
+                                    | ({row["intent"]["pair"] for row in self.recovery.orders.values()}
+                                       if self.config.recovery.enabled else set()),
                                     allow_entries=self.equity > self.config.risk.reserve and self.entry_allowed,
                                     entry_check=self._entry_check if self.config.adaptive.enabled else None,
                                     candidate_filter=self._candidate_filter if self.config.adaptive.enabled else None)
@@ -377,7 +445,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     market, self.positions.get(pair, ZERO),
                     self.inventory.age(pair, self.positions.get(pair, ZERO), now),
                     self.config.risk, self.config.adaptive, now, signal if protecting else None,
-                    allow_open=self.entry_allowed and not joint_breach,
+                    allow_open=self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair),
                     blocked_side=self.inventory.blocked_side(pair, now),
                     gamma=self.gamma.value(pair),
                 )
@@ -385,7 +453,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 self.recorder.decision(now, market, self.positions.get(pair, ZERO),
                                        self.inventory.age(pair, self.positions.get(pair, ZERO), now),
                                        self.config.risk, self.config.adaptive, signal if protecting else None,
-                                       self.entry_allowed and not joint_breach, self.inventory.blocked_side(pair, now),
+                                       self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair), self.inventory.blocked_side(pair, now),
                                        self.gamma.value(pair), plan)
                 opening = any(not q.close for q in plan.intents)
                 existing_close = any(o.intent.pair == pair and o.intent.close for o in self.orders.values())
@@ -581,6 +649,17 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.selection_rejections.pop(pair, None)
         return eligible
 
+    def _recovered_pair_open_ready(self, pair):
+        if pair not in self._recovery_correlation_pairs:
+            return True
+        others = [p for p, slot in self.portfolio.slots.items() if p != pair and slot.state == "active"]
+        if self.return_history.eligible(pair, others, self.current_timestamp):
+            self._recovery_correlation_pairs.discard(pair)
+            self.selection_rejections.pop(pair, None)
+            return True
+        self.selection_rejections[pair] = "recovery correlation warmup or too high"
+        return False
+
     def _exposure_inputs(self, snapshots):
         prices = {p: max(self.position_marks.get(p, ZERO), snapshots[p].mid if p in snapshots else ZERO)
                   for p in self.contracts}
@@ -638,6 +717,137 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 )))
         self.next_signal_log = now + 10
 
+    async def _order_detail(self, client_id):
+        row = self.recovery.orders[client_id]
+        try:
+            return await self.connector._api_get(
+                path_url=C.ORDER_STATUS_PATH_URL.format(id=row["exchange_id"] or client_id),
+                is_auth_required=True, limit_id=C.ORDER_STATUS_LIMIT_ID)
+        except IOError as exc:
+            if re.search(r'["\']label["\']\s*:\s*["\']ORDER_NOT_FOUND["\']', str(exc)):
+                return None
+            raise
+
+    async def _order_fills(self, exchange_id, pair):
+        result = []
+        limit = 1000
+        for offset in range(0, self.config.recovery.max_fills_per_order, limit):
+            page = await self.connector._api_get(
+                path_url=C.MY_TRADES_PATH_URL, is_auth_required=True, limit_id=C.MY_TRADES_PATH_URL,
+                params={"order": exchange_id, "contract": pair.replace("-", "_"), "limit": limit, "offset": offset})
+            result.extend(page)
+            if len(page) < limit:
+                return result
+        raise ValueError("Order fill pagination limit reached; recovery cannot prove completeness")
+
+    async def _sync_recovery_orders(self, client_ids, open_orders, cancel_old):
+        """Verify order identity before cancellation; replay actual fills only.
+
+        A terminal record is pruned only after order totals, fill IDs and a later
+        independent REST position snapshot all agree. New market CLOSE orders
+        issued during startup verification are excluded from the old-ID set.
+        """
+        client_ids = [cid for cid in client_ids if cid in self.recovery.orders]
+        semaphore = asyncio.Semaphore(4)
+        user = self.account_risk.anchor["user"]
+
+        async def fetch(client_id):
+            async with semaphore:
+                raw = await self._order_detail(client_id)
+                row = self.recovery.orders[client_id]
+                intent = intent_from_json(row["intent"])
+                if raw is None:
+                    if self.recovery.filled(client_id) != 0:
+                        raise ValueError("A previously filled strategy order is missing from Gate history")
+                    if (any(o.get("text") == client_id for o in open_orders)
+                            or self.current_timestamp - row["submitted_at"] < self.config.recovery.not_found_grace_seconds):
+                        return client_id, None, {}, False
+                    return client_id, None, {}, True
+                multiplier = Decimal(str(self.contracts[intent.pair]["quanto_multiplier"]))
+                expected_fill = self.recovery.validate_order(client_id, raw, multiplier, user)
+                rows = await self._order_fills(row["exchange_id"], intent.pair)
+                fills = self.recovery.trade_rows(client_id, rows, multiplier, self.current_timestamp)
+                if sum((v["amount"] for v in fills.values()), ZERO) != expected_fill:
+                    raise RuntimeError("Order status and trade totals disagree; waiting for settlement")
+                return client_id, raw, fills, raw["status"] == "finished"
+
+        results = await asyncio.gather(*(fetch(client_id) for client_id in client_ids))
+        # All identities are checked before touching any exchange order.
+        fills = [(cid, tid, value) for cid, raw, trades, done in results for tid, value in trades.items()
+                 if tid not in self.recovery.orders[cid]["fills"]]
+        previous_ages = self.inventory.opened_at.copy()
+        self._replaying_fills = True
+        try:
+            for cid, tid, value in sorted(fills, key=lambda item: (item[2]["timestamp"], item[1])):
+                intent = intent_from_json(self.recovery.orders[cid]["intent"])
+                fee = None if value["fee"] is None else SimpleNamespace(
+                    percent=ZERO, percent_token="USDT", flat_fees=[SimpleNamespace(token="USDT", amount=value["fee"])])
+                event = SimpleNamespace(order_id=cid, exchange_trade_id=tid, amount=value["amount"],
+                                        price=value["price"], timestamp=value["timestamp"], trade_fee=fee)
+                self.did_fill_order(event)
+                # Missing older callbacks cannot make an existing holding
+                # appear younger. Conservative ages include the offline gap.
+                if self.expected_positions.get(intent.pair, ZERO):
+                    self.inventory.opened_at[intent.pair] = min(
+                        self.inventory.opened_at.get(intent.pair, value["timestamp"]),
+                        previous_ages.get(intent.pair, value["timestamp"]), value["timestamp"])
+        finally:
+            self._replaying_fills = False
+        pending = False
+        terminal = set()
+        for cid, raw, trades, done in results:
+            row = self.recovery.orders[cid]
+            intent = intent_from_json(row["intent"])
+            if done:
+                row["terminal"] = True
+                if any(o.get("text") == cid for o in open_orders):
+                    pending = True
+                else:
+                    terminal.add(cid)
+                continue
+            pending = True
+            if raw is not None and (cancel_old or row["terminal"]) and not (intent.close and intent.market):
+                self._checkpoint()
+                await self.connector._api_delete(
+                    path_url=C.ORDER_STATUS_PATH_URL.format(id=row["exchange_id"]),
+                    is_auth_required=True, limit_id=C.ORDER_DELETE_LIMIT_ID)
+                self.recorder.record("recovery_cancel_requested", self.current_timestamp, order_id=cid)
+        if self.recovery.recovering:
+            self._recovery_pending_settlements = terminal
+            if pending:
+                self.recovery.wait("waiting for old order cancellation, market CLOSE completion, or submission grace")
+        else:
+            self._recovery_pending_settlements = terminal
+            self._recovery_block_open = pending
+        self._checkpoint()
+        return not pending
+
+    async def _cancel_old_submission_tasks(self, client_ids=None):
+        tasks = getattr(self.connector, "_gate_portfolio_order_tasks", {})
+        cancelled = []
+        for client_id in self._restart_order_ids if client_ids is None else client_ids:
+            task = tasks.get(client_id)
+            if task is not None and not task.done():
+                task.cancel()
+                cancelled.append(task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+    async def _setup_recovered(self, positions, account):
+        if account.get("in_dual_mode", False) or account.get("position_mode", "single") != "single":
+            raise ValueError("Recovery requires the original one-way account mode")
+        self.connector._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
+        by_pair = {p["contract"].replace("_", "-"): p for p in positions}
+        for pair in self.contracts:
+            if pair in by_pair:
+                if Decimal(str(by_pair[pair].get("leverage", "0"))) != 1:
+                    raise ValueError("Recovered position leverage is not confirmed 1x; no automatic leverage change")
+            elif not self.account_risk.latched:
+                success, message = await self.connector._set_trading_pair_leverage(pair, 1)
+                if not success:
+                    raise ValueError(f"Could not confirm 1x leverage for recovered flat contract {pair}: {message}")
+            self.connector._perpetual_trading.set_leverage(pair, 1)
+
     async def _refresh(self):
         try:
             if self.run_started_at is None:
@@ -653,11 +863,42 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 return
             if self.config.account_risk.enabled:
                 self.account_risk.validate_account(account)
+            recovering = self.config.recovery.enabled and self.recovery.recovering and not self.config.dry_run
+            if recovering:
+                known = set(self.recovery.orders) | set(self.orders)
+                if any(o.get("text") not in known for o in open_orders):
+                    raise ValueError("Recovery found an unowned exchange order; manual reconciliation required")
+                await self._cancel_old_submission_tasks()
+                self._recovery_verified = False
+                try:
+                    if not await self._sync_recovery_orders(self._restart_order_ids, open_orders, True):
+                        self.account_dirty = True
+                        return
+                except RuntimeError as exc:
+                    self.recovery.wait(str(exc))
+                    self.account_dirty = True
+                    return
+                if epoch != self.account_epoch:
+                    self.recovery.wait("offline fills replayed; waiting for a new private position snapshot")
+                    self.account_dirty = True
+                    return
+            elif self.config.recovery.enabled and self.initialized and not self.config.dry_run:
+                terminal_ids = [cid for cid, row in self.recovery.orders.items() if row["terminal"]]
+                self._recovery_block_open = bool(terminal_ids)
+                if terminal_ids:
+                    try:
+                        await self._sync_recovery_orders(terminal_ids, open_orders, False)
+                    except (IOError, RuntimeError) as exc:
+                        self._recovery_block_open = True
+                        self.logger().warning(f"Terminal order settlement pending: {exc}")
+                    if epoch != self.account_epoch:
+                        self.account_dirty = True
+                        return
             nonzero = [p for p in positions if Decimal(str(p["size"])) != 0]
             if not self.initialized and not self.config.dry_run:
-                if nonzero or open_orders:
+                if not recovering and (nonzero or open_orders):
                     raise ValueError("Start requires a flat futures account with no exchange open orders; reconcile existing exposure first")
-                if not self.account_risk.latched:
+                if not recovering and not self.account_risk.latched:
                     await self._setup_live()
             unknown = [o for o in open_orders if o.get("text") not in self.orders
                        and o.get("text") not in self.terminal_orders]
@@ -688,7 +929,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     self.account_dirty = True
                     self._cancel_all()
                     self.logger().warning("REST positions disagree with confirmed fills; waiting for reconciliation")
+                    if recovering:
+                        self.recovery.wait("exchange positions differ from persisted and replayed strategy fills; manual review if persistent")
                     return
+                if recovering and not self.initialized:
+                    await self._setup_recovered(nonzero, account)
+                    if epoch != self.account_epoch:
+                        return
             self.positions = converted
             if self.config.adaptive.enabled:
                 self.inventory.reconcile(converted, self.current_timestamp)
@@ -709,6 +956,27 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                 self._checkpoint()
                 if not self._opening_ready():
                     self._cancel_opening_orders()
+            if self.config.recovery.enabled:
+                if recovering:
+                    if self.account_risk.reconciliation_error or self.persistence_error:
+                        self.recovery.wait(self.account_risk.reconciliation_error or self.persistence_error)
+                    else:
+                        self._recovery_verified = True
+                        fingerprint = json.dumps(dict(positions={p: str(a) for p, a in sorted(converted.items())},
+                                                       open_ids=sorted(o.get("text", "") for o in open_orders),
+                                                       cash_ids=sorted(cashflows.records)), sort_keys=True)
+                        if self.recovery.confirm(fingerprint, self.current_timestamp):
+                            self.recovery.phase, self.recovery.reason = "ready", "exchange reconciliation complete"
+                            self.recorder.record("recovery_complete", self.current_timestamp, positions=converted)
+                if not self.recovery.recovering or self._recovery_verified:
+                    for client_id in self._recovery_pending_settlements:
+                        self.recovery.orders.pop(client_id, None)
+                        self.terminal_orders.pop(client_id, None)
+                        self._restart_order_ids.discard(client_id)
+                        if hasattr(self.connector, "stop_tracking_order"):
+                            self.connector.stop_tracking_order(client_id)
+                    self._recovery_pending_settlements.clear()
+                self._checkpoint()
             self.recorder.record("account", self.current_timestamp, revision=self.revision + 1,
                                  equity=self.equity, available=self.available, positions=self.positions,
                                  risk=self.account_risk.dump(), cash_totals=self.account_risk.cash_totals,
@@ -883,10 +1151,53 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if adjusted.amount > intent.amount:
             raise ValueError("Budget checker unexpectedly increased an order")
         intent = Intent(intent.pair, intent.buy, adjusted.amount, intent.price, intent.close, intent.market)
+        reserved_id = None
+        if self.config.recovery.enabled:
+            try:
+                reserved_id = self.recovery.new_id()
+                self.recovery.prepare(reserved_id, intent, self.current_timestamp)
+                if not self._checkpoint():
+                    self.recovery.orders.pop(reserved_id, None)
+                    reserved_id = None
+                    if not intent.close:
+                        return
+                    self.logger().error("CLOSE allowed without a durable recovery journal; later restart may need manual reconciliation")
+            except ValueError as exc:
+                self.logger().error(str(exc))
+                self._recovery_block_open = True
+                reserved_id = None
+                if not intent.close:
+                    return
+            if reserved_id is not None:
+                try:
+                    self.connector.reserve_portfolio_order_id(reserved_id)
+                except Exception:
+                    self.recovery.orders[reserved_id]["terminal"] = True
+                    self.terminal_orders[reserved_id] = TrackedOrder(intent, intent.amount, self.current_timestamp)
+                    self._recovery_block_open = True
+                    self._checkpoint()
+                    raise
         method = self.buy if intent.buy else self.sell
-        order_id = method(self.connector_name, intent.pair, intent.amount, candidate.order_type,
-                          price=intent.price, position_action=PositionAction.CLOSE if intent.close else PositionAction.OPEN)
+        try:
+            order_id = method(self.connector_name, intent.pair, intent.amount, candidate.order_type,
+                              price=intent.price, position_action=PositionAction.CLOSE if intent.close else PositionAction.OPEN)
+        except Exception as exc:
+            if reserved_id is not None:
+                if getattr(self.connector, "_gate_portfolio_client_order_id", None) == reserved_id:
+                    del self.connector._gate_portfolio_client_order_id
+                self.recovery.orders[reserved_id]["terminal"] = True
+                self.terminal_orders[reserved_id] = TrackedOrder(intent, intent.amount, self.current_timestamp)
+                self._recovery_block_open = True
+                self._checkpoint()
+            else:
+                self.halt_reason = "Unjournaled submission failed; manual order reconciliation required"
+            self.logger().error(f"Order submission requires reconciliation: {exc}")
+            return
         self.orders[order_id] = TrackedOrder(intent, intent.amount, self.current_timestamp)
+        if reserved_id is not None and order_id != reserved_id:
+            self.halt_reason = "Connector did not honor the persisted client order ID"
+            self._cancel_all()
+            return
         self.recorder.record("submitted", self.current_timestamp, order_id=order_id, intent=intent)
         self.next_quote[intent.pair] = self.current_timestamp + self.config.quote_refresh_seconds
         self._remember_quote_signal(intent.pair)
@@ -915,6 +1226,25 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         order = self.orders.get(event.order_id) or self.terminal_orders.get(event.order_id)
         if order is not None:
             trade_id = str(getattr(event, "exchange_trade_id", "") or "")
+            if self.config.recovery.enabled:
+                if self.recovery.recovering and event.order_id in self._restart_order_ids and not self._replaying_fills:
+                    self.account_epoch += 1
+                    self.account_dirty = True
+                    return  # Historical REST replay owns restored executions.
+                if event.order_id.startswith("t-ga") and event.order_id not in self.recovery.orders:
+                    return  # Already proved settled and persisted before pruning.
+                if event.order_id in self.recovery.orders:
+                    try:
+                        if not self.recovery.fill(event.order_id, trade_id, event.amount,
+                                                  getattr(event, "price", order.intent.price),
+                                                  getattr(event, "timestamp", self.current_timestamp)):
+                            return
+                    except ValueError as exc:
+                        self.recovery.orders[event.order_id]["terminal"] = True
+                        self._recovery_block_open = self.account_dirty = True
+                        self.next_account = 0
+                        self.logger().error(f"Fill requires REST reconciliation: {exc}")
+                        return
             key = (event.order_id, trade_id)
             if trade_id and key in self.fill_ids:
                 return
@@ -943,6 +1273,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.account_dirty = True
             # Reprice both sides only after the new position is reconciled.
             self.next_quote[order.intent.pair] = 0
+            if not self.stopping:
+                self._checkpoint()
 
     def _terminal(self, event):
         order = self.orders.pop(event.order_id, None)
@@ -950,10 +1282,14 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.recorder.record("terminal", self.current_timestamp, order_id=event.order_id,
                                  event_type=type(event).__name__, remaining=order.remaining)
             self.terminal_orders[event.order_id] = order
+            if event.order_id in self.recovery.orders:
+                self.recovery.orders[event.order_id]["terminal"] = True
             self.account_epoch += 1
             self.account_dirty = True
             if order.intent.pair in self.portfolio.excluded:
                 self.next_monitor = 0
+            if not self.stopping:
+                self._checkpoint()
 
     did_cancel_order = _terminal
     did_fail_order = _terminal
@@ -968,6 +1304,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if self.refresh_task and not self.refresh_task.done():
             self.refresh_task.cancel()
             await asyncio.gather(self.refresh_task, return_exceptions=True)
+        await self._cancel_old_submission_tasks(set(self.recovery.orders))
         self._cancel_all()
         self._checkpoint()
         self.recorder.record("strategy_stop", self.current_timestamp, positions=self.positions,
@@ -979,7 +1316,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         # Hummingbot stopping removes the strategy clock. Do not claim that a
         # cancellation request or a sent close order is a confirmed flat account.
         if self.positions or self.orders or self.exchange_open_pairs or any(self.expected_positions.values()):
-            self.logger().warning("Strategy stopped with possible positions/orders; check Gate and reconcile before restarting")
+            self.logger().warning("Strategy stopped with possible positions/orders; preserve the checkpoint for restart reconciliation")
 
     def format_status(self):
         lines = [f"Gate Avellaneda portfolio: {'DRY RUN (no orders)' if self.config.dry_run else 'LIVE'}",
@@ -990,6 +1327,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                          f"peak={self.account_risk.peak}, drawdown={self.account_risk.drawdown}, "
                          f"latched={self.account_risk.latched}, reason={self.account_risk.reason or '-'}, "
                          f"reconciliation={self.account_risk.reconciliation_error or 'OK'}")
+        if self.config.recovery.enabled:
+            lines.append(f"Recovery: phase={self.recovery.phase}, reason={self.recovery.reason or '-'}, "
+                         f"unsettled_orders={len(self.recovery.orders)}, terminal_settlement_block={self._recovery_block_open}, "
+                         f"correlation_wait={sorted(self._recovery_correlation_pairs)}")
         if self.persistence_error or self.recorder.error:
             lines.append(f"Opening paused: {self.persistence_error or self.recorder.error}")
         if self.config.adaptive.enabled:

@@ -23,7 +23,7 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_tickers = {
             t["contract"].replace("_", "-"): t for t in self.connector.tickers}
         self.config = adapter.GateAvellanedaPortfolioConfig(
-            dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False),
+            dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False), recovery=dict(enabled=False),
             account_risk=dict(state_path=self.directory.name + "/risk.json"),
             telemetry=dict(path=self.directory.name + "/quality.jsonl"))
         self.bot = self.new_bot()

@@ -1,4 +1,5 @@
 import asyncio
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +44,36 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
     TICK_INTERVAL_LIMIT = 120.0
 
     web_utils = web_utils
+
+    def reserve_portfolio_order_id(self, client_id: str):
+        """Use one pre-journaled ID through the normal strategy buy/sell path."""
+        if not re.fullmatch(r"t-ga[0-9a-f]{24}", client_id):
+            raise ValueError("Invalid portfolio client order ID")
+        if getattr(self, "_gate_portfolio_client_order_id", None) is not None:
+            raise ValueError("Portfolio order ID already reserved")
+        self._gate_portfolio_client_order_id = client_id
+
+    def buy(self, trading_pair: str, amount: Decimal, order_type=OrderType.LIMIT, price=s_decimal_NaN, **kwargs) -> str:
+        return self._order_with_reserved_id(TradeType.BUY, trading_pair, amount, order_type, price, **kwargs)
+
+    def sell(self, trading_pair: str, amount: Decimal, order_type=OrderType.LIMIT, price=s_decimal_NaN, **kwargs) -> str:
+        return self._order_with_reserved_id(TradeType.SELL, trading_pair, amount, order_type, price, **kwargs)
+
+    def _order_with_reserved_id(self, trade_type, trading_pair, amount, order_type, price, **kwargs):
+        client_id = getattr(self, "_gate_portfolio_client_order_id", None)
+        if client_id is None:
+            method = super().buy if trade_type == TradeType.BUY else super().sell
+            return method(trading_pair, amount, order_type, price, **kwargs)
+        del self._gate_portfolio_client_order_id
+        task = asyncio.ensure_future(self._create_order(
+            trade_type=trade_type, order_id=client_id, trading_pair=trading_pair,
+            amount=amount, order_type=order_type, price=price, **kwargs))
+        tasks = getattr(self, "_gate_portfolio_order_tasks", None)
+        if tasks is None:
+            self._gate_portfolio_order_tasks = tasks = {}
+        tasks[client_id] = task
+        task.add_done_callback(lambda completed: tasks.pop(client_id, None))
+        return client_id
 
     def __init__(self,
                  gate_io_perpetual_api_key: str,

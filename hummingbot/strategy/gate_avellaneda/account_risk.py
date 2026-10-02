@@ -87,12 +87,18 @@ class RiskStateStore:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
     def load(self):
-        if not self.path.exists():
+        return self.read_file(self.path)
+
+    @classmethod
+    def read_file(cls, path):
+        """Read/checksum before market subscriptions; writer locks in ctor."""
+        path = Path(path)
+        if not path.exists():
             return None
         try:
-            envelope = json.loads(self.path.read_text())
+            envelope = json.loads(path.read_text())
             payload = envelope["payload"]
-            digest = hashlib.sha256(self.encoded(payload)).hexdigest()
+            digest = hashlib.sha256(cls.encoded(payload)).hexdigest()
             if envelope["version"] != 1 or envelope["sha256"] != digest:
                 raise ValueError("Risk state version/checksum mismatch")
             return payload

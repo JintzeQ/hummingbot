@@ -11,6 +11,13 @@ quote_refresh_seconds: 15
 exit_timeout_seconds: 60
 allow_market_exit: true
 maker_fee_floor: '0.0002'
+recovery:
+  enabled: true # journal-owned exposure only; new/legacy unowned positions are refused
+  confirm_snapshots: 2
+  quiet_seconds: 5
+  not_found_grace_seconds: 120
+  max_pending_orders: 128
+  max_fills_per_order: 10000
 account_risk:
   enabled: true
   persist: true # mandatory for live account risk; dry-run has a separate file
