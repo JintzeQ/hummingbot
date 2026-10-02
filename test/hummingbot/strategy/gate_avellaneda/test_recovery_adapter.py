@@ -121,7 +121,7 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_contracts = {p: contract(p) for p in self.pairs}
         self.connector = RecoveryConnector(self.pairs)
         adapter.GateAvellanedaPortfolio._initial_tickers = {t["contract"].replace("_", "-"): t for t in self.connector.tickers}
-        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
             dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False),
             account_risk=dict(state_path=self.directory.name + "/risk.json"),
             telemetry=dict(path=self.directory.name + "/quality.jsonl"))
@@ -600,7 +600,7 @@ class RecoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_recovery_requires_persistent_risk(self):
         for account_risk in (dict(enabled=False), dict(persist=False)):
             with self.assertRaisesRegex(ValueError, "persistent"):
-                adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=account_risk)
+                adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=account_risk)
 
 
     async def test_cash_ownership_write_retry_does_not_leave_live_terminal_ghost(self):

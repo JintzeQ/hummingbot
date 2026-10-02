@@ -17,7 +17,7 @@ class MicroAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_tickers = {
             t["contract"].replace("_", "-"): t for t in self.connector.tickers
         }
-        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False),
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False),
             adaptive=dict(enabled=False),
             micro=MicroSettings(warmup_seconds=1, min_samples=3, confirm_seconds=1, recover_seconds=2, retire_seconds=5),
         )
@@ -195,8 +195,8 @@ class MicroAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(self.connector, "_gate_market_signal_feed"))
 
     def test_nested_config_validates_mode_and_thresholds(self):
-        config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), micro=dict(mode="observe", micro_weight="0.1"))
+        config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), micro=dict(mode="observe", micro_weight="0.1"))
         self.assertEqual(config.micro.micro_weight, D("0.1"))
         for values in [dict(mode="bad"), dict(micro_weight="NaN"), dict(max_age=0), dict(depth_floor_ratio="1")]:
             with self.subTest(values=values), self.assertRaises(ValueError):
-                adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), micro=values)
+                adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), micro=values)

@@ -148,10 +148,10 @@ class QualityRecorder:
         self.pending = [fill for fill in self.pending if fill["remaining"]]
 
     def decision(self, now, market, position, age, risk, adaptive, signal, allow_open, blocked_side, gamma, plan,
-                 quality=None, exit_cost_bps=Decimal(0)):
+                 quality=None, exit_cost_bps=Decimal(0), calibration=None, shadow=None):
         return self.record("decision", now, market=market, position=position, age=age, risk=risk,
                            adaptive=adaptive, signal=signal, allow_open=allow_open, quality=quality, exit_cost_bps=exit_cost_bps,
-                           blocked_side=blocked_side, gamma=gamma, expected=plan)
+                           blocked_side=blocked_side, gamma=gamma, expected=plan, calibration=calibration, shadow=shadow)
 
 
 def dataclass_from_json(cls, data):
@@ -164,12 +164,18 @@ def replay_decision(record):
         raise ValueError("Unsupported decision record")
     market = dataclass_from_json(Market, record["market"])
     signal = dataclass_from_json(MicroSignal, record["signal"]) if record["signal"] is not None else None
-    plan = quote_plan(market, Decimal(record["position"]), record["age"],
-                      dataclass_from_json(Settings, record["risk"]),
-                      dataclass_from_json(AdaptiveSettings, record["adaptive"]), record["at"], signal,
-                      allow_open=record["allow_open"], blocked_side=record["blocked_side"], gamma=Decimal(record["gamma"]),
-                      quality=record.get("quality"), exit_cost_bps=Decimal(record.get("exit_cost_bps", "0")))
-    return plain(plan) == record["expected"]
+    def replay(calibration):
+        return quote_plan(market, Decimal(record["position"]), record["age"],
+                          dataclass_from_json(Settings, record["risk"]),
+                          dataclass_from_json(AdaptiveSettings, record["adaptive"]), record["at"], signal,
+                          allow_open=record["allow_open"], blocked_side=record["blocked_side"], gamma=Decimal(record["gamma"]),
+                          quality=record.get("quality"), exit_cost_bps=Decimal(record.get("exit_cost_bps", "0")),
+                          calibration=calibration)
+    calibration = record.get("calibration")
+    matches = plain(replay(calibration)) == record["expected"]
+    if record.get("shadow") is not None:
+        matches = matches and bool(calibration) and plain(replay(dict(calibration, mode="protect"))) == record["shadow"]
+    return matches
 
 
 def audit_report(records):
@@ -214,5 +220,8 @@ def audit_report(records):
                             quote_retained=sum(r["kind"] == "quote_retained" and r.get("pair") == pair for r in rows))
     return dict(fills=len(fills), close_fills=sum(r["close"] for r in fills), by_pair=by_pair,
                 replay_checked=len(decisions), replay_mismatches=sum(not replay_decision(r) for r in decisions),
+                kline_calibration=dict(decisions=sum(bool(r.get("calibration")) for r in decisions),
+                                       ready=sum(bool((r.get("calibration") or {}).get("ready")) for r in decisions),
+                                       shadow_checked=sum(r.get("shadow") is not None for r in decisions)),
                 markouts=by_horizon, latest_account=latest,
                 note="Observed markouts are not realized strategy profit; no synthetic fills. Missing rotated logs limit coverage.")

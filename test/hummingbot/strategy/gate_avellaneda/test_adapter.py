@@ -24,7 +24,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             for p in pairs
         }
         self.connector = FakeConnector(pairs)
-        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False), micro=dict(enabled=False), adaptive=dict(enabled=False))
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False), micro=dict(enabled=False), adaptive=dict(enabled=False))
         self.bot = adapter.GateAvellanedaPortfolio({"gate_io_perpetual": self.connector}, self.config)
 
     async def ready(self, live=False):
@@ -603,7 +603,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
 class BootstrapTests(unittest.TestCase):
     def test_public_startup_builds_candidate_subscription_pool(self):
-        config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), candidate_limit=2)
+        config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), candidate_limit=2)
         contracts = [contract(p) for p in ("A-USDT", "B-USDT", "C-USDT")]
         tickers = [dict(contract=p.replace("-", "_"), last="10", volume_24h_quote="10000000")
                    for p in ("A-USDT", "B-USDT", "C-USDT")]
@@ -615,15 +615,15 @@ class BootstrapTests(unittest.TestCase):
     def test_empty_universe_fails_with_message(self):
         with patch.object(adapter, "urlopen", side_effect=[io.BytesIO(b"[]"), io.BytesIO(b"[]")]):
             with self.assertRaisesRegex(ValueError, "No affordable"):
-                adapter.GateAvellanedaPortfolio.init_markets(adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), ))
+                adapter.GateAvellanedaPortfolio.init_markets(adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), ))
 
     def test_pydantic_validates_nested_budget(self):
         with self.assertRaises(ValueError):
-            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk=dict(capital="50"))
+            adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk=dict(capital="50"))
 
     def test_refresh_period_must_fit_staleness_threshold(self):
         with self.assertRaisesRegex(ValueError, "max_age"):
-            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), book_refresh_seconds=30)
+            adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), book_refresh_seconds=30)
 
 
 class ConnectorRegressionTests(unittest.IsolatedAsyncioTestCase):

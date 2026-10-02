@@ -22,7 +22,7 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.connector.account = account()
         adapter.GateAvellanedaPortfolio._initial_tickers = {
             t["contract"].replace("_", "-"): t for t in self.connector.tickers}
-        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False),
             dry_run=False, micro=dict(enabled=False), adaptive=dict(require_correlation=False), recovery=dict(enabled=False),
             account_risk=dict(state_path=self.directory.name + "/risk.json"),
             telemetry=dict(path=self.directory.name + "/quality.jsonl"))
@@ -286,7 +286,7 @@ class AccountAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_live_persistence_cannot_be_disabled_while_account_guard_enabled(self):
         with self.assertRaisesRegex(ValueError, "persistent"):
-            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), dry_run=False, account_risk=dict(persist=False))
+            adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), dry_run=False, account_risk=dict(persist=False))
 
     async def test_latched_market_close_survives_cash_endpoint_outage(self):
         await self.ready()

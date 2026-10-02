@@ -140,3 +140,19 @@ risk:
   max_age: 15
   failures_to_retire: 3
   cooldown: 600
+kline_volatility:
+  enabled: true # futures closed-candle calibration; requires adaptive + telemetry
+  mode: observe # protect applies bounded opening-only widening; never changes 5U loss stop
+  interval: 1m
+  lookback_bars: 720
+  min_returns: 120
+  refresh_seconds: 60
+  request_timeout_seconds: 5
+  max_age_seconds: 180
+  quote_horizon_seconds: 15
+  tail_probability: '0.25' # normal terminal-price tail; NOT order fill probability
+  smoothing_seconds: 300
+  max_relative_change: '0.1'
+  weight: '0.25'
+  max_multiplier: '1.5'
+  max_extra_bps: '5'

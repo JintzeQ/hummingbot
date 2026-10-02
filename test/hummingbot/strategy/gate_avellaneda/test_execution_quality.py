@@ -114,7 +114,7 @@ class ExecutionAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_tickers = {t['contract'].replace('_','-'):t for t in self.connector.tickers}
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.config = adapter.GateAvellanedaPortfolioConfig(dry_run=False, account_risk=dict(enabled=False),
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), dry_run=False, account_risk=dict(enabled=False),
             recovery=dict(enabled=False), telemetry=dict(path=self.directory.name+"/quality.jsonl"), micro=dict(enabled=False),
             adaptive=dict(require_correlation=False))
         self.bot = adapter.GateAvellanedaPortfolio({'gate_io_perpetual':self.connector}, self.config)

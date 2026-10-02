@@ -35,6 +35,7 @@ from hummingbot.strategy.gate_avellaneda.adaptive import (
     AdaptiveSettings, InventoryTracker, LossCircuit, ReturnHistory, entry_rejection,
     exposure_bounds, exposure_scale, limit_exposure, quote_plan,
 )
+from hummingbot.strategy.gate_avellaneda.kline_volatility import KlineSettings, KlineVolatility, calibrated_half_spread
 from hummingbot.strategy.gate_avellaneda.gamma import GammaController, GammaSettings, GammaState
 from hummingbot.strategy.gate_avellaneda.account_risk import (
     AccountBookSnapshot, AccountRisk, AccountRiskSettings, RiskStateStore, finite, finite_time, mode_path,
@@ -62,6 +63,7 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
     deadman: DeadmanSettings = Field(default_factory=DeadmanSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     quality_control: QualitySettings = Field(default_factory=QualitySettings)
+    kline_volatility: KlineSettings = Field(default_factory=KlineSettings)
     candidate_limit: int = Field(default=20, ge=2, le=40)
     candidate_pairs: List[str] = Field(default_factory=list)
     sample_ticks: int = Field(default=60, ge=20, le=600)
@@ -75,6 +77,8 @@ class GateAvellanedaPortfolioConfig(BaseClientModel):
 
     @model_validator(mode="after")
     def validate_refresh_age(self):
+        if self.kline_volatility.enabled and (not self.adaptive.enabled or not self.telemetry.enabled):
+            raise ValueError("K-line calibration requires adaptive pricing and telemetry")
         if self.quality_control.enabled and (not self.adaptive.enabled or not self.telemetry.enabled):
             raise ValueError("Execution quality requires adaptive pricing and observed-fill telemetry")
         if self.recovery.enabled and (not self.account_risk.enabled or not self.account_risk.persist):
@@ -146,6 +150,10 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         self.plans = {}
         self.last_control_limits = {}
         self.last_quality_limits = {}
+        self.kline_volatility = KlineVolatility(config.kline_volatility)
+        self.kline_task = None
+        self.next_kline = 0
+        self.last_calibration_limits = {}
         self.entry_allowed = True
         self.selection_rejections = {}
         self.portfolio = Portfolio(config.risk)
@@ -360,6 +368,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.recorder.sample(now, {}, 0)
             self._cancel_all()
             return
+        self._kline_tick(now)
         self._heartbeat_tick(now)
         self._sample()
         snapshots = self._snapshots()
@@ -484,9 +493,13 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                     allow_open=self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair),
                     blocked_side=self.inventory.blocked_side(pair, now),
                     gamma=self.gamma.value(pair), quality=self._quality_snapshot(market),
-                    exit_cost_bps=self._exit_cost_bps(market),
+                    exit_cost_bps=self._exit_cost_bps(market), calibration=self._calibration_snapshot(pair),
                 )
                 self.plans[pair] = plan
+                extra = self._calibration_extra(market)
+                if extra > self.last_calibration_limits.get(pair, ZERO):
+                    self._cancel_opening_orders(pair)
+                    self.next_quote[pair] = 0
                 quality_now = self._quality_snapshot(market)
                 previous_quality = self.last_quality_limits.get(pair, {})
                 if any((row.get("block", False) and not previous_quality.get(side, {}).get("block", False))
@@ -500,7 +513,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                                        self.config.risk, self.config.adaptive, signal if protecting else None,
                                        self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair), self.inventory.blocked_side(pair, now),
                                        self.gamma.value(pair), plan, quality=self._quality_snapshot(market),
-                                       exit_cost_bps=self._exit_cost_bps(market))
+                                       exit_cost_bps=self._exit_cost_bps(market),
+                                       calibration=self._calibration_snapshot(pair),
+                                       shadow=self._calibration_shadow(market, protecting, joint_breach))
                 opening = any(not q.close for q in plan.intents)
                 existing_close = any(o.intent.pair == pair and o.intent.close for o in self.orders.values())
                 if not opening:
@@ -687,6 +702,58 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
     def _quality_snapshot(self, market):
         return self.quality.snapshot(market.pair, self._quality_regime(market), self.current_timestamp)
 
+    def _kline_tick(self, now):
+        if (self.config.kline_volatility.enabled and now >= self.next_kline
+                and (self.kline_task is None or self.kline_task.done())):
+            self.next_kline = now + self.config.kline_volatility.refresh_seconds
+            self.kline_task = asyncio.create_task(self._refresh_klines())
+
+    async def _refresh_klines(self):
+        # Public data never holds the private account refresh or CLOSE path.
+        cfg = self.config.kline_volatility
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch(pair):
+            async with semaphore:
+                try:
+                    rows = await asyncio.wait_for(self.connector._api_get(
+                        path_url=C.CANDLESTICKS_PATH_URL,
+                        params={"contract": pair.replace("-", "_"), "interval": cfg.interval,
+                                "limit": cfg.lookback_bars + 1, "timezone": "utc0"},
+                        is_auth_required=False, limit_id=C.CANDLESTICKS_PATH_URL),
+                        timeout=cfg.request_timeout_seconds)
+                    value = self.kline_volatility.update(pair, rows, self.current_timestamp)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    value = self.kline_volatility.fail(pair, self.current_timestamp, str(exc))
+                self.recorder.record("kline_calibration", self.current_timestamp, observation=value, settings=cfg)
+
+        await asyncio.gather(*(fetch(pair) for pair in self.contracts))
+
+    def _calibration_snapshot(self, pair):
+        return self.kline_volatility.snapshot(pair, self.current_timestamp)
+
+    def _calibration_extra(self, market):
+        base = self.config.adaptive.spread_multiplier * (
+            self.gamma.value(market.pair) * market.volatility / market.mid / 2
+            + (1 + 1 / (market.kappa * market.mid)).ln())
+        return calibrated_half_spread(base, self._calibration_snapshot(market.pair)) - base
+
+    def _calibration_shadow(self, market, protecting, joint_breach):
+        calibration = self._calibration_snapshot(market.pair)
+        if not calibration or calibration["mode"] != "observe" or not calibration["ready"]:
+            return None
+        pair, now = market.pair, self.current_timestamp
+        return quote_plan(market, self.positions.get(pair, ZERO),
+                          self.inventory.age(pair, self.positions.get(pair, ZERO), now),
+                          self.config.risk, self.config.adaptive, now,
+                          self.signals.get(pair) if protecting else None,
+                          allow_open=self.entry_allowed and not joint_breach and self._recovered_pair_open_ready(pair),
+                          blocked_side=self.inventory.blocked_side(pair, now), gamma=self.gamma.value(pair),
+                          quality=self._quality_snapshot(market), exit_cost_bps=self._exit_cost_bps(market),
+                          calibration=dict(calibration, mode="protect"))
+
     def _exit_cost_bps(self, market):
         cfg = self.config.quality_control
         if not cfg.enabled or cfg.mode != "protect":
@@ -700,7 +767,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         evidence = [Decimal(row["mean_net_bps"]) for row in quality.values() if row.get("ready")]
         plan = quote_plan(market, ZERO, 0, self.config.risk, self.config.adaptive, self.current_timestamp,
                           self.signals.get(market.pair) if self.config.micro.enabled and self.config.micro.mode == "protect" else None,
-                          gamma=self.gamma.value(market.pair), quality=quality, exit_cost_bps=self._exit_cost_bps(market))
+                          gamma=self.gamma.value(market.pair), quality=quality, exit_cost_bps=self._exit_cost_bps(market),
+                          calibration=self._calibration_snapshot(market.pair))
         margins = [(abs(q.price - plan.reference) / plan.reference - 2 * market.maker_fee) * 10000
                    for q in plan.intents if not q.close]
         margin = min(margins) - self._exit_cost_bps(market) if margins else ZERO
@@ -776,7 +844,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             return "microstructure opening paused"
         return entry_rejection(market, self.config.risk, self.config.adaptive, self.current_timestamp, signal,
                                gamma=self.gamma.value(market.pair), quality=self._quality_snapshot(market),
-                               exit_cost_bps=self._exit_cost_bps(market))
+                               exit_cost_bps=self._exit_cost_bps(market),
+                               calibration=self._calibration_snapshot(market.pair))
 
     def _gamma_reprice_needed(self, pair, plan, market, now):
         if (plan.gamma == self.last_gamma_values.get(pair, plan.gamma)
@@ -852,6 +921,7 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             market = self.last_markets.get(pair)
             if market is not None:
                 self.last_quality_limits[pair] = self._quality_snapshot(market)
+                self.last_calibration_limits[pair] = self._calibration_extra(market)
             self.last_gamma_values[pair] = self.plans[pair].gamma
 
     def _micro_telemetry(self, now):
@@ -1435,7 +1505,8 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
             self.halt_reason = "Connector did not honor the persisted client order ID"
             self._cancel_all()
             return
-        self.recorder.record("submitted", self.current_timestamp, order_id=order_id, intent=intent)
+        self.recorder.record("submitted", self.current_timestamp, order_id=order_id, intent=intent,
+                             calibration=self._calibration_snapshot(intent.pair))
         self.next_quote[intent.pair] = self.current_timestamp + self.config.quote_refresh_seconds
         self._remember_quote_signal(intent.pair)
 
@@ -1547,6 +1618,9 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
             await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+        if self.kline_task and not self.kline_task.done():
+            self.kline_task.cancel()
+            await asyncio.gather(self.kline_task, return_exceptions=True)
         # Leave the exchange countdown armed after stopping.
         if self.refresh_task and not self.refresh_task.done():
             self.refresh_task.cancel()
@@ -1614,6 +1688,12 @@ class GateAvellanedaPortfolio(ScriptStrategyBase):
                              f"position_cap={plan.position_cap}, order_quote={plan.order_quote}, signal_confidence={plan.confidence}, "
                              f"effective_reference={plan.reference}, buy_premium={plan.buy_premium}, sell_premium={plan.sell_premium}, "
                              f"entry_reason={plan.entry_reason or '-'}")
+            calibration = self._calibration_snapshot(pair)
+            if calibration:
+                lines.append(f"  K-line={calibration['mode']}, ready={calibration['ready']}, "
+                             f"returns={calibration['samples']}, daily_sigma={calibration['daily_volatility'] * 100}%, "
+                             f"suggested_half_bps={calibration['suggested_half_spread'] * 10000}, "
+                             f"reason={calibration['reason'] or '-'}")
             signal = self.signals.get(pair)
             if self.config.micro.enabled and signal:
                 lines.append(f"  micro={self.config.micro.mode}, ready={signal.ready}, reference={signal.reference}, "

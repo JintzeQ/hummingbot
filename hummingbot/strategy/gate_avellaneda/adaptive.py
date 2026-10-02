@@ -12,6 +12,7 @@ from typing import Optional
 
 from hummingbot.strategy.gate_avellaneda.core import Intent, Market, Settings, ZERO, floor_step
 from hummingbot.strategy.gate_avellaneda.microstructure import MicroSignal
+from hummingbot.strategy.gate_avellaneda.kline_volatility import calibrated_half_spread
 
 D = Decimal
 ONE = D("1")
@@ -137,7 +138,7 @@ def _close_quote(market, position, risk, price):
 def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, settings: AdaptiveSettings,
                now: float, signal: Optional[MicroSignal] = None, allow_open: bool = True,
                blocked_side: Optional[bool] = None, gamma: Optional[Decimal] = None,
-               quality=None, exit_cost_bps: Decimal = ZERO) -> QuotePlan:
+               quality=None, exit_cost_bps: Decimal = ZERO, calibration=None) -> QuotePlan:
     gamma = risk.gamma if gamma is None else gamma
     plan = QuotePlan(gamma=gamma)
     unsafe = market.close_rejection(risk, now)
@@ -156,6 +157,10 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
         price = market.mid if age >= settings.age_ramp_seconds else (market.bid if position < 0 else market.ask)
         plan.intents = _close_quote(market, position, risk, price)
         return plan
+    if (calibration and calibration.get("enabled") and calibration.get("mode") == "protect"
+            and not calibration.get("ready")):
+        allow_open = False
+        plan.entry_reason = "K-line calibration unavailable"
     scale = exposure_scale(market, risk, settings)
     plan.position_cap = risk.max_position_quote * scale
     plan.order_quote = risk.order_quote * scale
@@ -172,6 +177,7 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     liquidity = (ONE + ONE / (market.kappa * market.mid)).ln()
     base_half = settings.spread_multiplier * (market.volatility / market.mid / 2 + liquidity)
     opening_half = settings.spread_multiplier * (gamma * market.volatility / market.mid / 2 + liquidity)
+    opening_half = calibrated_half_spread(opening_half, calibration)
     fee_floor = max(ZERO, market.maker_fee) + risk.min_net_spread / 2
     center = plan.reference - plan.pressure * market.mid
     prices, close_prices = {}, {}
@@ -230,8 +236,8 @@ def quote_plan(market: Market, position: Decimal, age: float, risk: Settings, se
     return plan
 
 
-def entry_rejection(market, risk, settings, now, signal=None, gamma=None, quality=None, exit_cost_bps=ZERO):
-    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal, gamma=gamma, quality=quality, exit_cost_bps=exit_cost_bps)
+def entry_rejection(market, risk, settings, now, signal=None, gamma=None, quality=None, exit_cost_bps=ZERO, calibration=None):
+    plan = quote_plan(market, ZERO, 0, risk, settings, now, signal, gamma=gamma, quality=quality, exit_cost_bps=exit_cost_bps, calibration=calibration)
     return None if len(plan.intents) == 2 else plan.entry_reason or "no executable adaptive opening"
 
 

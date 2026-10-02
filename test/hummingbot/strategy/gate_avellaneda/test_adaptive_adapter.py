@@ -20,7 +20,7 @@ class AdaptiveAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.GateAvellanedaPortfolio._initial_tickers = {
             t["contract"].replace("_", "-"): t for t in self.connector.tickers
         }
-        self.config = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False),
+        self.config = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), account_risk=dict(enabled=False), telemetry=dict(enabled=False), recovery=dict(enabled=False),
             micro=MicroSettings(warmup_seconds=1, min_samples=3, confirm_seconds=1, recover_seconds=2, retire_seconds=5),
             adaptive=AdaptiveSettings(require_correlation=False), dry_run=False,
         )
@@ -262,10 +262,10 @@ class AdaptiveAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_gamma_config_checks_baseline_and_keeps_legacy_mode_available(self):
         with self.assertRaises(ValueError):
-            adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"})
-        fixed = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"}, gamma_control={"enabled": False})
+            adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"})
+        fixed = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"}, gamma_control={"enabled": False})
         self.assertEqual(fixed.risk.gamma, 4)
-        legacy = adapter.GateAvellanedaPortfolioConfig(deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"}, adaptive={"enabled": False})
+        legacy = adapter.GateAvellanedaPortfolioConfig(kline_volatility=dict(enabled=False), deadman=dict(enabled=False), execution=dict(retain_quotes=False), quality_control=dict(enabled=False), risk={"gamma": "4"}, adaptive={"enabled": False})
         self.assertEqual(legacy.risk.gamma, 4)
 
     async def test_pair_net_loss_adapts_gamma_without_affecting_other_pair(self):

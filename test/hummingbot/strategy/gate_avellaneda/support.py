@@ -99,7 +99,7 @@ def module(name, **attributes):
 
 
 constants = module("hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_constants",
-                   COUNTDOWN_CANCEL_PATH_URL="futures/usdt/countdown_cancel_all",
+                   CANDLESTICKS_PATH_URL="futures/usdt/candlesticks", COUNTDOWN_CANCEL_PATH_URL="futures/usdt/countdown_cancel_all",
                    POSITION_INFORMATION_URL="positions", USER_BALANCES_PATH_URL="account",
                    USER_ORDERS_PATH_URL="orders", NETWORK_CHECK_PATH_URL="network",
                    TICKER_PATH_URL="tickers", ORDER_BOOK_PATH_URL="book", ORDER_CREATE_PATH_URL="create",

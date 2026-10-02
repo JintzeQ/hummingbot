@@ -178,7 +178,7 @@ class Portfolio:
             market = markets.get(pair)
             reason = reject(market) if market else "stale market data"
             # Data loss is a pause, not evidence that a coin's economics changed.
-            if reason in ("stale market data", "invalid market values", "indicators warming up"):
+            if reason in ("stale market data", "invalid market values", "indicators warming up", "K-line calibration unavailable"):
                 continue
             slot.failures = slot.failures + 1 if reason else 0
             slot.reason = reason or ""
